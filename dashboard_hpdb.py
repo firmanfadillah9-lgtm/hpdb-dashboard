@@ -218,6 +218,13 @@ def get_connection():
     """DuckDB connection, query langsung dari file parquet (lazy/columnar)."""
     path = get_data_path()
     con = duckdb.connect(":memory:")
+    # Streamlit Community Cloud memberi ~1 GB per app. Tanpa batas,
+    # DuckDB memakai default ~80% RAM HOST (bukan batas container),
+    # lalu container dibunuh OOM tanpa traceback -- itu penyebab
+    # "Oh no" dan healthz connection reset.
+    con.execute("SET memory_limit='500MB'")
+    con.execute("SET threads=2")
+    con.execute("SET temp_directory='/tmp/duckdb_spill'")
     con.execute(f"CREATE VIEW hpdb AS SELECT * FROM read_parquet('{path}')")
     return con
 
@@ -453,13 +460,19 @@ def get_coords_con():
             dl = requests.get(
                 asset_url,
                 headers={**headers, "Accept": "application/octet-stream"},
-                timeout=300
+                stream=True, timeout=300
             )
             if dl.status_code != 200:
                 return None, None
+            # Dialirkan per potongan; dl.content akan menahan seluruh
+            # berkas (~56 MB) di memori sekaligus.
             with open(path, "wb") as f:
-                f.write(dl.content)
+                for chunk in dl.iter_content(chunk_size=1024 * 256):
+                    f.write(chunk)
         coords_con = duckdb.connect()
+        coords_con.execute("SET memory_limit='250MB'")
+        coords_con.execute("SET threads=2")
+        coords_con.execute("SET temp_directory='/tmp/duckdb_spill'")
         coords_con.execute(f"CREATE VIEW coords AS SELECT * FROM read_parquet('{path}')")
         coords_con.execute("""
             CREATE VIEW coords_f AS
@@ -1488,10 +1501,11 @@ with tab_progress:
                 if asset_url:
                     dl = requests.get(asset_url,
                                       headers={**headers, "Accept": "application/octet-stream"},
-                                      timeout=300)
+                                      stream=True, timeout=300)
                     if dl.status_code == 200:
                         with open(path, "wb") as f:
-                            f.write(dl.content)
+                            for chunk in dl.iter_content(chunk_size=1024 * 256):
+                                f.write(chunk)
             if not os.path.exists(path):
                 return None
             dfh = pd.read_parquet(path)
