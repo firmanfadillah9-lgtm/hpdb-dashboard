@@ -14,6 +14,7 @@ Cara jalankan:
 import streamlit as st
 import pandas as pd
 import threading
+import math
 import time
 import duckdb
 import requests
@@ -21,128 +22,119 @@ import os
 import hashlib
 import io
 
-try:
-    OSRM_BASE = st.secrets["osrm"]["url"].rstrip("/")
-except Exception:
-    OSRM_BASE = "https://router.project-osrm.org"  # fallback ke public server
 
 
 # ---------------------------------------------------------------------------
-# OSRM dengan ANGGARAN WAKTU.
+# ROUTING via OpenRouteService (ORS).
 #
-# Satu pengecekan koordinat bisa memicu belasan permintaan HTTP berurutan.
-# Kalau server rute lambat atau mengabaikan permintaan (server demo publik
-# sering menolak IP datacenter), satu script run Streamlit terblokir sampai
-# puluhan detik, health check platform menyerah, dan app dibunuh tanpa
-# menyisakan traceback.
+# Kenapa pindah dari OSRM publik: router.project-osrm.org umum menolak atau
+# mengabaikan permintaan dari IP datacenter seperti Streamlit Cloud, sehingga
+# tiap panggilan menggantung sampai timeout dan app dibunuh health check.
 #
-# Jadi SELURUH pemanggilan OSRM dalam satu script run dibatasi satu anggaran
-# waktu. Begitu habis, sisanya langsung menyerah tanpa menunggu. Hasil yang
-# BERHASIL disimpan di session_state; kegagalan sengaja TIDAK disimpan,
-# supaya satu gangguan sesaat tidak mematikan fitur ini seharian.
+# ORS juga lebih hemat: SATU permintaan sudah memberi jarak sekaligus
+# geometri rute. Pola lama butuh 4 permintaan per FAT (2 snap + 1 jarak +
+# 1 geometri); sekarang 1. Untuk 3 FAT: 12 permintaan -> 3.
+#
+# Titik snap diambil dari ujung geometri rute yang dikembalikan ORS, lalu
+# jarak rumah->jalan dan jalan->FAT dihitung sendiri secara haversine,
+# supaya rumusnya tetap sama dengan tool "Homepass Validation" (Olympus):
+#     road_distance = snap(customer) + route + snap(FAT)
+#
+# Kuota gratis 2.000 permintaan/hari. Hasil yang berhasil disimpan di
+# session_state; kegagalan TIDAK disimpan supaya gangguan sesaat tidak
+# mematikan fitur ini. Anggaran waktu tetap berlaku sebagai pengaman.
 # ---------------------------------------------------------------------------
-OSRM_ANGGARAN_S = 8.0      # total untuk semua panggilan dalam satu script run
-OSRM_PER_CALL_S = 2.5      # batas tiap permintaan
+ORS_BASE = "https://api.openrouteservice.org"
+ORS_PROFILE = "driving-car"
+ANGGARAN_RUTE_S = 10.0     # total semua permintaan dalam satu script run
+PER_CALL_S = 4.0           # batas tiap permintaan
 
 
-def osrm_mulai_anggaran(detik: float = OSRM_ANGGARAN_S) -> None:
-    st.session_state["_osrm_batas"] = time.monotonic() + detik
-
-
-def _osrm_sisa() -> float:
-    return max(0.0, st.session_state.get("_osrm_batas", 0.0) - time.monotonic())
-
-
-def _osrm_cache() -> dict:
-    return st.session_state.setdefault("_osrm_cache", {})
-
-
-def _osrm_minta(path: str, params: dict | None = None):
-    """Satu permintaan OSRM, tunduk pada anggaran. None kalau menyerah."""
-    sisa = _osrm_sisa()
-    if sisa < 0.5:
-        return None
+def _ors_key() -> str:
     try:
-        resp = requests.get(f"{OSRM_BASE}{path}", params=params,
-                            timeout=min(OSRM_PER_CALL_S, sisa))
-        data = resp.json()
-        return data if data.get("code") == "Ok" else None
+        return st.secrets["ors"]["key"]
     except Exception:
-        return None
+        return ""
 
 
-def osrm_nearest(lat, lon, profile="driving"):
-    """Snap koordinat ke jalan terdekat. (lat, lon, jarak_snap_m) atau (None, None, None)."""
-    kunci = ("n", profile, round(lat, 6), round(lon, 6))
-    c = _osrm_cache()
+def rute_mulai_anggaran(detik: float = ANGGARAN_RUTE_S) -> None:
+    st.session_state["_rute_batas"] = time.monotonic() + detik
+
+
+def _rute_sisa() -> float:
+    return max(0.0, st.session_state.get("_rute_batas", 0.0) - time.monotonic())
+
+
+def _rute_cache() -> dict:
+    return st.session_state.setdefault("_rute_cache", {})
+
+
+def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def ors_rute(lat1, lon1, lat2, lon2):
+    """Satu permintaan ORS -> (jarak_rute_m, titik_rute). (None, None) kalau gagal."""
+    kunci = (round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
+    c = _rute_cache()
     if kunci in c:
         return c[kunci]
-    data = _osrm_minta(f"/nearest/v1/{profile}/{lon},{lat}")
-    if not data:
-        return None, None, None
-    wp = data["waypoints"][0]
-    slon, slat = wp["location"]
-    hasil = (slat, slon, wp.get("distance", 0))
-    c[kunci] = hasil
-    return hasil
 
+    key = _ors_key()
+    if not key:
+        return None, None
+    sisa = _rute_sisa()
+    if sisa < 0.5:
+        return None, None
 
-def osrm_route_distance(lat1, lon1, lat2, lon2, profile="driving"):
-    """Jarak rute jalan antara 2 titik. Meter atau None."""
-    kunci = ("d", profile, round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
-    c = _osrm_cache()
-    if kunci in c:
-        return c[kunci]
-    data = _osrm_minta(f"/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}",
-                       {"overview": "false"})
-    if not data:
-        return None
-    c[kunci] = data["routes"][0]["distance"]
+    try:
+        resp = requests.post(
+            f"{ORS_BASE}/v2/directions/{ORS_PROFILE}/geojson",
+            json={"coordinates": [[lon1, lat1], [lon2, lat2]]},
+            headers={"Authorization": key, "Content-Type": "application/json"},
+            timeout=min(PER_CALL_S, sisa),
+        )
+        if resp.status_code != 200:
+            return None, None
+        feat = resp.json()["features"][0]
+        jarak = feat["properties"]["summary"]["distance"]
+        titik = [[x[1], x[0]] for x in feat["geometry"]["coordinates"]]
+    except Exception:
+        return None, None
+
+    c[kunci] = (jarak, titik)
     return c[kunci]
 
 
-def osrm_route_geometry(lat1, lon1, lat2, lon2, profile="driving"):
-    """Geometri rute jalan sebagai list [lat, lon], atau None."""
-    kunci = ("g", profile, round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
-    c = _osrm_cache()
-    if kunci in c:
-        return c[kunci]
-    data = _osrm_minta(f"/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}",
-                       {"overview": "full", "geometries": "geojson"})
-    if not data:
-        return None
-    c[kunci] = [[x[1], x[0]] for x in data["routes"][0]["geometry"]["coordinates"]]
-    return c[kunci]
+def calc_road_distance(cust_lat, cust_lon, fat_lat, fat_lon, profile=None):
+    """Jarak jalan customer -> FAT, rumus Olympus.
 
-
-def calc_road_distance(cust_lat, cust_lon, fat_lat, fat_lon, profile="driving"):
+    road_distance = snap(customer) + route + snap(FAT)
+    Return dict: {road_distance_m, success, detail, route_pts}
     """
-    Hitung road distance dari customer ke FAT, mereplikasi formula tool XL
-    "Homepass Validation" (Olympus): snap kedua titik ke jalan terdekat,
-    lalu hitung rute antar titik snap tersebut.
+    jarak, titik = ors_rute(cust_lat, cust_lon, fat_lat, fat_lon)
+    if jarak is None:
+        alasan = ("API key ORS belum diisi di Secrets"
+                  if not _ors_key() else
+                  "Server rute tidak merespons atau titik tidak terhubung jalan")
+        return {"road_distance_m": None, "success": False,
+                "detail": alasan, "route_pts": None}
 
-    road_distance = snap(customer->jalan) + route(jalan->jalan) + snap(FAT->jalan)
-
-    Return dict: {road_distance_m, success, detail}
-    """
-    c_lat, c_lon, c_snap = osrm_nearest(cust_lat, cust_lon, profile)
-    if c_lat is None:
-        return {"road_distance_m": None, "success": False, "detail": "Gagal snap koordinat customer ke jalan"}
-
-    f_lat, f_lon, f_snap = osrm_nearest(fat_lat, fat_lon, profile)
-    if f_lat is None:
-        return {"road_distance_m": None, "success": False, "detail": "Gagal snap koordinat FAT ke jalan"}
-
-    route_dist = osrm_route_distance(c_lat, c_lon, f_lat, f_lon, profile)
-    if route_dist is None:
-        return {"road_distance_m": None, "success": False, "detail": "Gagal hitung rute jalan (kemungkinan tidak terhubung)"}
-
-    total = c_snap + route_dist + f_snap
+    snap_c = _haversine_m(cust_lat, cust_lon, titik[0][0], titik[0][1]) if titik else 0.0
+    snap_f = _haversine_m(fat_lat, fat_lon, titik[-1][0], titik[-1][1]) if titik else 0.0
+    total = snap_c + jarak + snap_f
     return {
         "road_distance_m": round(total, 1),
         "success": True,
-        "detail": f"snap_customer={c_snap:.1f}m + route={route_dist:.1f}m + snap_fat={f_snap:.1f}m"
+        "detail": f"snap_customer={snap_c:.1f}m + route={jarak:.1f}m + snap_fat={snap_f:.1f}m",
+        "route_pts": titik,
     }
+
 
 from datetime import datetime
 
@@ -940,7 +932,7 @@ with tab_eligibility:
             road_results = {}
             if top_n > 0:
                 # Seluruh panggilan OSRM di script run ini dibatasi 8 detik.
-                osrm_mulai_anggaran()
+                rute_mulai_anggaran()
                 with st.spinner(f"Menghitung jarak jalan untuk {top_n} FAT terdekat..."):
                     for idx in range(top_n):
                         row = nearby.iloc[idx]
@@ -953,9 +945,9 @@ with tab_eligibility:
                 )
                 if _berhasil == 0:
                     st.warning(
-                        "Server rute (OSRM) tidak merespons dalam batas waktu. "
-                        "Angka di bawah memakai jarak udara. Untuk jarak jalan yang "
-                        "andal, arahkan ke server sendiri lewat Secrets:  [osrm] url = \"...\""
+                        "Jarak jalan tidak tersedia — angka di bawah memakai jarak udara. "
+                        "Pastikan API key OpenRouteService sudah diisi di Secrets:  "
+                        "[ors] key = \"...\""
                     )
 
             # ─── PETA (Folium — satelit + marker interaktif) ─────────────────
@@ -1025,7 +1017,9 @@ with tab_eligibility:
                     # Garis input -> FAT untuk 5 terdekat: MENGIKUTI JALAN (OSRM route)
                     if r["FAT_CODE"] in road_results:
                         _clr = "#2ecc71" if is_elig else "#e74c3c"
-                        route_pts = osrm_route_geometry(input_lat, input_lon, r["lat"], r["lon"])
+                        # Geometri sudah ikut terbawa dari calc_road_distance,
+                        # jadi tidak ada permintaan jaringan tambahan di sini.
+                        route_pts = _rr.get("route_pts") if isinstance(_rr, dict) else None
                         if route_pts and len(route_pts) >= 2:
                             # Segmen snap (putus-putus): rumah->jalan dan jalan->FAT
                             folium.PolyLine([[input_lat, input_lon], route_pts[0]],
