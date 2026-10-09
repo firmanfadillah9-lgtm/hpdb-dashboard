@@ -551,7 +551,7 @@ def render_fat_detail(con, fat_code):
     status_col, _ = st.columns([1, 2])
     with status_col:
         st.dataframe(
-            status_counts, use_container_width=True, hide_index=True,
+            status_counts, width="stretch", hide_index=True,
             column_config={
                 "HOMEPASS_STATUS": st.column_config.TextColumn("Status"),
                 "jumlah": st.column_config.NumberColumn("Jumlah"),
@@ -576,7 +576,7 @@ def render_fat_detail(con, fat_code):
 
     st.dataframe(
         hpid_list,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=400,
         column_config={
@@ -690,7 +690,7 @@ with tab_overview:
             labels={"jumlah": "Jumlah", "REGION": "Region", "HOMEPASS_STATUS": "Status"}
         )
         fig.update_layout(height=450, xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ─── BREAKDOWN PER VENDOR ─────────────────────────────────────────────────
     st.subheader("🏢 Breakdown per Vendor")
@@ -705,7 +705,7 @@ with tab_overview:
             labels={"jumlah": "Jumlah", "VENDOR_NAME": "Vendor"}
         )
         fig2.update_layout(height=400, xaxis_tickangle=-45)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     # ─── PETA CAKUPAN FAT (radius 150m) ───────────────────────────────────────
     st.markdown("---")
@@ -1344,7 +1344,7 @@ with tab_eligibility:
                         "Eligible_Road_150m": ("✅" if road_d <= RADIUS_M else "❌") if road_d is not None else "?",
                     })
                 df_comp = pd.DataFrame(comp_rows)
-                st.dataframe(df_comp, use_container_width=True, hide_index=True)
+                st.dataframe(df_comp, width="stretch", hide_index=True)
 
                 # Cek kalau ada perbedaan eligibility air vs road (case penting!)
                 mismatch = [
@@ -1492,7 +1492,7 @@ with tab_eligibility:
                         df_hpid_display.columns = ["HPID", "Status", "FAT", "Vendor", "Jarak (m)"]
                         st.dataframe(
                             df_hpid_display,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                             height=min(50 + len(df_hpid_display) * 35, 300),
                             column_config={
@@ -1795,7 +1795,7 @@ with tab_bulk:
                     col_s3.metric("⭐ Aktivasi HPID", n_aktivasi)
                     col_s4.metric("ℹ️ Sudah Terdaftar", n_exists)
 
-                    st.dataframe(df_result, use_container_width=True, hide_index=True)
+                    st.dataframe(df_result, width="stretch", hide_index=True)
 
                     # Download Excel
                     output = io.BytesIO()
@@ -2020,7 +2020,7 @@ with tab_progress:
                 legend=dict(orientation="h", y=-0.2),
                 margin=dict(t=30, b=10),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         # ── Pivot per CITY (format PPT) ───────────────────────────────────
         st.markdown("#### 🏙️ Breakdown per City")
@@ -2042,7 +2042,7 @@ with tab_progress:
             total_row = pv.sum().to_frame().T
             total_row.index = ["GRAND TOTAL"]
             pv_show = pd.concat([pv, total_row])
-            st.dataframe(pv_show, use_container_width=True, height=420)
+            st.dataframe(pv_show, width="stretch", height=420)
 
             import io as _io
             _out = _io.BytesIO()
@@ -2111,13 +2111,13 @@ with tab_dummy:
             FROM hpdb WHERE {_dummy_where}
             GROUP BY 1 ORDER BY 2 DESC
         """).fetchdf()
-        st.dataframe(df_vendor, use_container_width=True, hide_index=True)
+        st.dataframe(df_vendor, width="stretch", hide_index=True)
         if not df_vendor.empty:
             import plotly.express as px
             fig_v = px.bar(df_vendor, x="Jumlah", y="Vendor", orientation="h",
                            text="Jumlah", height=300)
             fig_v.update_layout(margin=dict(t=10, b=10), yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig_v, use_container_width=True)
+            st.plotly_chart(fig_v, width="stretch")
 
     with c2:
         st.markdown("#### Per Status")
@@ -2126,12 +2126,12 @@ with tab_dummy:
             FROM hpdb WHERE {_dummy_where}
             GROUP BY 1 ORDER BY 2 DESC
         """).fetchdf()
-        st.dataframe(df_status, use_container_width=True, hide_index=True)
+        st.dataframe(df_status, width="stretch", hide_index=True)
         if not df_status.empty:
             import plotly.express as px
             fig_s = px.pie(df_status, names="Status", values="Jumlah", hole=0.4, height=300)
             fig_s.update_layout(margin=dict(t=10, b=10))
-            st.plotly_chart(fig_s, use_container_width=True)
+            st.plotly_chart(fig_s, width="stretch")
 
     st.markdown("---")
     st.markdown("#### 🏙️ Per Kota (top 15)")
@@ -2140,7 +2140,7 @@ with tab_dummy:
         FROM hpdb WHERE {_dummy_where}
         GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 15
     """).fetchdf()
-    st.dataframe(df_city, use_container_width=True, hide_index=True)
+    st.dataframe(df_city, width="stretch", hide_index=True)
 
     st.markdown("---")
     st.markdown("#### 📋 Daftar Lengkap HPID Dummy")
@@ -2165,7 +2165,7 @@ with tab_dummy:
         ORDER BY VENDOR_NAME, HOMEPASS_ID
     """).fetchdf()
     st.caption(f"Menampilkan {len(df_list):,} HPID dummy.")
-    st.dataframe(df_list, use_container_width=True, height=420, hide_index=True)
+    st.dataframe(df_list, width="stretch", height=420, hide_index=True)
 
     # Download Excel
     import io as _io

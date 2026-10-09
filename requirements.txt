@@ -4,7 +4,7 @@ pandas>=1.5,<3.0
 plotly
 requests
 openpyxl
-pyarrow
+pyarrow<25
 folium
 streamlit-folium
 xlsxwriter
