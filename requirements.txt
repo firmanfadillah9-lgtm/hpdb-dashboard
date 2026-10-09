@@ -1,0 +1,9 @@
+streamlit
+duckdb
+pandas>=1.5,<3.0
+plotly
+requests
+openpyxl
+pyarrow
+folium
+streamlit-folium

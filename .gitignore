@@ -1,0 +1,38 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Rahasia - JANGAN PERNAH di-commit
+github_token.txt
+session.json
+csrf.txt
+telegram_config.py
+*.env
+
+# Database & log
+*.duckdb
+*.duckdb.wal
+logs/
+
+# Backup & sementara
+*.bak
+*.tmp
+~$*
+
+# Data besar - didistribusi lewat GitHub Release, bukan git
+*.csv
+*.xlsx
+*.xlsb
+*.xlsm
+*.parquet
+
+.streamlit/
+telegram_config*.py
+*.bas
+
+osrm-data/
+*.osm.pbf
+*.osrm
+*.osrm.*
