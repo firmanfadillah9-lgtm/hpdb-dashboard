@@ -36,3 +36,4 @@ osrm-data/
 *.osm.pbf
 *.osrm
 *.osrm.*
+*.bak*
