@@ -11,7 +11,9 @@ import os
 import time
 import duckdb
 
-DUCKDB_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "hpdb.duckdb")
+# PENTING: sumber yang benar adalah addhp.duckdb di root folder (hasil sync_hpdb.py).
+# data/hpdb.duckdb adalah sisa lama (Juni) dan kurang ~1,8 juta baris.
+DUCKDB_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "addhp.duckdb")
 PARQUET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "hpdb.parquet")
 
 con = duckdb.connect(DUCKDB_PATH, read_only=True)

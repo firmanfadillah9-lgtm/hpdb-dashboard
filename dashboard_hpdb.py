@@ -225,6 +225,62 @@ def get_connection():
 con = get_connection()
 
 
+# ---------------------------------------------------------------------------
+# Helper ber-cache.
+# Streamlit menjalankan ULANG seluruh skrip setiap kali satu widget disentuh.
+# Tanpa cache, tab Overview + sidebar memakan ~2,4 detik di SETIAP interaksi.
+# Kunci cache-nya hanya string filter, jadi kombinasi yang sama langsung
+# dijawab dari memori.
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def opsi_distinct(kolom: str):
+    """Daftar nilai unik satu kolom untuk dropdown sidebar."""
+    rows = con.execute(
+        f"SELECT DISTINCT {kolom} FROM hpdb WHERE {kolom} IS NOT NULL ORDER BY 1"
+    ).fetchall()
+    return ["Semua"] + [r[0] for r in rows]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def metrik_overview(w: str):
+    """Enam metrik Overview dalam SATU kali pembacaan parquet.
+
+    Sebelumnya enam query terpisah (1,95 s). Digabung jadi 1,32 s, lalu
+    nol pada interaksi berikutnya karena di-cache.
+    """
+    return con.execute(f"""
+        SELECT COUNT(*) AS total_rows,
+               COUNT(*) FILTER (WHERE HOMEPASS_ID <> '-----')       AS total_hp,
+               COUNT(*) FILTER (WHERE HOMEPASS_STATUS = 'ACTIVE')   AS aktif,
+               COUNT(*) FILTER (WHERE HOMEPASS_STATUS = 'ASSIGNED') AS assigned,
+               COUNT(DISTINCT FAT_CODE) FILTER (WHERE FAT_CODE <> '-') AS total_fat,
+               COUNT(DISTINCT FAT_CODE) FILTER (
+                    WHERE FAT_CODE IS NOT NULL AND FAT_CODE <> '-'
+                      AND TRY_CAST(FAT_LATITUDE  AS DOUBLE) IS NOT NULL
+                      AND TRY_CAST(FAT_LONGITUDE AS DOUBLE) IS NOT NULL) AS fat_points
+        FROM hpdb WHERE {w}
+    """).fetchone()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def df_region_status(w: str):
+    return con.execute(f"""
+        SELECT REGION, HOMEPASS_STATUS, COUNT(*) as jumlah
+        FROM hpdb WHERE {w} AND REGION IS NOT NULL
+        GROUP BY REGION, HOMEPASS_STATUS ORDER BY REGION
+    """).df()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def df_vendor_top(w: str):
+    return con.execute(f"""
+        SELECT VENDOR_NAME, COUNT(*) as jumlah
+        FROM hpdb
+        WHERE {w} AND VENDOR_NAME IS NOT NULL AND VENDOR_NAME <> '-'
+        GROUP BY VENDOR_NAME ORDER BY jumlah DESC LIMIT 15
+    """).df()
+
+
 # ─── SIDEBAR ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"**{st.session_state.get('user_name', '')}**")
@@ -236,13 +292,8 @@ with st.sidebar:
 
     st.title("🔍 Filter")
 
-    regions = con.execute("SELECT DISTINCT REGION FROM hpdb WHERE REGION IS NOT NULL ORDER BY 1").fetchall()
-    region_options = ["Semua"] + [r[0] for r in regions]
-    selected_region = st.selectbox("Region", region_options)
-
-    vendors = con.execute("SELECT DISTINCT VENDOR_NAME FROM hpdb WHERE VENDOR_NAME IS NOT NULL ORDER BY 1").fetchall()
-    vendor_options = ["Semua"] + [v[0] for v in vendors]
-    selected_vendor = st.selectbox("Vendor", vendor_options)
+    selected_region = st.selectbox("Region", opsi_distinct("REGION"))
+    selected_vendor = st.selectbox("Vendor", opsi_distinct("VENDOR_NAME"))
 
     if st.button("🔄 Refresh Data"):
         if os.path.exists(LOCAL_CACHE):
@@ -426,48 +477,25 @@ def get_coords_con():
 
 with tab_overview:
 
-    total_rows = con.execute(f"SELECT COUNT(*) FROM hpdb WHERE {where_sql}").fetchone()[0]
+    # Enam metrik sekaligus dari satu query ber-cache.
+    (total_rows, total_hp, active, assigned,
+     total_fat, total_fat_points) = metrik_overview(where_sql)
+
     st.caption(f"Total records (sesuai filter): {total_rows:,}")
 
     # ─── METRICS ────────────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        total_hp = con.execute(
-            f"SELECT COUNT(*) FROM hpdb WHERE {where_sql} AND HOMEPASS_ID != '-----'"
-        ).fetchone()[0]
-        st.metric("Total Homepass", f"{total_hp:,}")
-
-    with col2:
-        active = con.execute(
-            f"SELECT COUNT(*) FROM hpdb WHERE {where_sql} AND HOMEPASS_STATUS = 'ACTIVE'"
-        ).fetchone()[0]
-        st.metric("Active", f"{active:,}")
-
-    with col3:
-        assigned = con.execute(
-            f"SELECT COUNT(*) FROM hpdb WHERE {where_sql} AND HOMEPASS_STATUS = 'ASSIGNED'"
-        ).fetchone()[0]
-        st.metric("Assigned", f"{assigned:,}")
-
-    with col4:
-        total_fat = con.execute(
-            f"SELECT COUNT(DISTINCT FAT_CODE) FROM hpdb WHERE {where_sql} AND FAT_CODE != '-'"
-        ).fetchone()[0]
-        st.metric("Total FAT", f"{total_fat:,}")
+    col1.metric("Total Homepass", f"{total_hp:,}")
+    col2.metric("Active", f"{active:,}")
+    col3.metric("Assigned", f"{assigned:,}")
+    col4.metric("Total FAT", f"{total_fat:,}")
 
     st.markdown("---")
 
     # ─── BREAKDOWN PER REGION ─────────────────────────────────────────────────
     st.subheader("📍 Breakdown per Region")
 
-    df_region = con.execute(f"""
-        SELECT REGION, HOMEPASS_STATUS, COUNT(*) as jumlah
-        FROM hpdb
-        WHERE {where_sql} AND REGION IS NOT NULL
-        GROUP BY REGION, HOMEPASS_STATUS
-        ORDER BY REGION
-    """).df()
+    df_region = df_region_status(where_sql)
 
     if not df_region.empty:
         import plotly.express as px
@@ -482,14 +510,7 @@ with tab_overview:
     # ─── BREAKDOWN PER VENDOR ─────────────────────────────────────────────────
     st.subheader("🏢 Breakdown per Vendor")
 
-    df_vendor = con.execute(f"""
-        SELECT VENDOR_NAME, COUNT(*) as jumlah
-        FROM hpdb
-        WHERE {where_sql} AND VENDOR_NAME IS NOT NULL AND VENDOR_NAME != '-'
-        GROUP BY VENDOR_NAME
-        ORDER BY jumlah DESC
-        LIMIT 15
-    """).df()
+    df_vendor = df_vendor_top(where_sql)
 
     if not df_vendor.empty:
         import plotly.express as px
@@ -507,12 +528,7 @@ with tab_overview:
 
     MAX_MAP_POINTS = 50_000
 
-    total_fat_points = con.execute(f"""
-        SELECT COUNT(DISTINCT FAT_CODE) FROM hpdb
-        WHERE {where_sql} AND FAT_CODE IS NOT NULL AND FAT_CODE != '-'
-          AND TRY_CAST(FAT_LATITUDE AS DOUBLE) IS NOT NULL
-          AND TRY_CAST(FAT_LONGITUDE AS DOUBLE) IS NOT NULL
-    """).fetchone()[0]
+    # total_fat_points sudah ikut dihitung di metrik_overview(where_sql)
 
     if total_fat_points == 0:
         st.info("Tidak ada koordinat FAT untuk ditampilkan sesuai filter saat ini.")
