@@ -263,7 +263,14 @@ def get_connection():
     # DuckDB memakai default ~80% RAM HOST (bukan batas container),
     # lalu container dibunuh OOM tanpa traceback -- itu penyebab
     # "Oh no" dan healthz connection reset.
-    con.execute("SET memory_limit='500MB'")
+    # Diukur pada data 8 Okt (7.581.901 baris / 245,8 MB), puncak RSS
+    # sesudah tab Overview dibuka:
+    #   memory_limit=500MB -> 565 MB   metrik 1,2s
+    #   memory_limit=250MB -> 405 MB   metrik 1,6s
+    # Turun 160 MB cuma dengan ongkos setengah detik. Di container 1 GB
+    # yang juga menanggung koneksi coords, pandas, folium dan Streamlit
+    # sendiri, 160 MB itu beda antara jalan dan dibunuh OOM.
+    con.execute("SET memory_limit='250MB'")
     con.execute("SET threads=2")
     con.execute("SET temp_directory='/tmp/duckdb_spill'")
     # Tanpa ini, COPY ... TO csv menahan hasil di memori demi menjaga urutan
@@ -642,7 +649,10 @@ def get_coords_con():
                 for chunk in dl.iter_content(chunk_size=1024 * 256):
                     f.write(chunk)
         coords_con = duckdb.connect()
-        coords_con.execute("SET memory_limit='250MB'")
+        # Query coords selalu dibatasi bounding box, jadi puncaknya 172 MB
+        # baik di 250MB maupun 80MB. Batas rendah dipasang untuk menjaga
+        # kasus terburuk kalau ada query tanpa bounding box.
+        coords_con.execute("SET memory_limit='120MB'")
         coords_con.execute("SET threads=2")
         coords_con.execute("SET temp_directory='/tmp/duckdb_spill'")
         coords_con.execute(f"CREATE VIEW coords AS SELECT * FROM read_parquet('{path}')")
