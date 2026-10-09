@@ -26,7 +26,8 @@ except Exception:
     OSRM_BASE = "https://router.project-osrm.org"  # fallback ke public server
 
 
-def osrm_nearest(lat, lon, profile="driving", timeout=8):
+@st.cache_data(ttl=86400, show_spinner=False)
+def osrm_nearest(lat, lon, profile="driving", timeout=4):
     """Snap koordinat ke jalan terdekat. Return (lat, lon, snap_distance_m) atau (None, None, None)."""
     try:
         url = f"{OSRM_BASE}/nearest/v1/{profile}/{lon},{lat}"
@@ -41,7 +42,8 @@ def osrm_nearest(lat, lon, profile="driving", timeout=8):
     return None, None, None
 
 
-def osrm_route_distance(lat1, lon1, lat2, lon2, profile="driving", timeout=8):
+@st.cache_data(ttl=86400, show_spinner=False)
+def osrm_route_distance(lat1, lon1, lat2, lon2, profile="driving", timeout=4):
     """Hitung jarak rute jalan antara 2 titik (yang sudah di-snap). Return distance_m atau None."""
     try:
         url = f"{OSRM_BASE}/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}"
@@ -54,7 +56,8 @@ def osrm_route_distance(lat1, lon1, lat2, lon2, profile="driving", timeout=8):
     return None
 
 
-def osrm_route_geometry(lat1, lon1, lat2, lon2, profile="driving", timeout=8):
+@st.cache_data(ttl=86400, show_spinner=False)
+def osrm_route_geometry(lat1, lon1, lat2, lon2, profile="driving", timeout=4):
     """Ambil geometri rute jalan (list [lat, lon]) antara 2 titik. Return list atau None."""
     try:
         url = f"{OSRM_BASE}/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}"
@@ -875,17 +878,29 @@ with tab_eligibility:
             if not nearby.empty:
                 nearby["distance_m"] = nearby["distance_m"].round(1)
 
-            # ─── HITUNG ROAD DISTANCE untuk top 5 FAT terdekat ──────────────
-            top_n = min(5, len(nearby))
+            # ─── JARAK JALAN (OSRM) — OPSIONAL ──────────────────────────────
+            # Tiap FAT butuh 4 permintaan HTTP ke server OSRM publik
+            # (2 nearest + 1 route + 1 geometry). Untuk 5 FAT itu 20
+            # permintaan berurutan. Server demo publik lambat dan dibatasi
+            # laju, sehingga satu script run bisa terblokir semenit lebih —
+            # health check Streamlit Cloud menyerah dan app dibunuh.
+            #
+            # Jadi defaultnya MATI: peta tampil seketika dengan jarak udara,
+            # dan jarak jalan dihitung hanya kalau diminta. Hasilnya
+            # di-cache 24 jam, jadi pengecekan ulang titik yang sama gratis.
+            pakai_osrm = st.checkbox(
+                "Hitung jarak jalan (OSRM) — lebih akurat, perlu beberapa detik",
+                value=False, key="pakai_osrm",
+            )
+            top_n = min(3, len(nearby)) if pakai_osrm else 0
             road_results = {}
             if top_n > 0:
-                with st.spinner(f"Menghitung jarak jalan (road distance) untuk {top_n} FAT terdekat..."):
+                with st.spinner(f"Menghitung jarak jalan untuk {top_n} FAT terdekat..."):
                     for idx in range(top_n):
                         row = nearby.iloc[idx]
-                        result = calc_road_distance(
+                        road_results[row["FAT_CODE"]] = calc_road_distance(
                             input_lat, input_lon, row["lat"], row["lon"]
                         )
-                        road_results[row["FAT_CODE"]] = result
 
             # ─── PETA (Folium — satelit + marker interaktif) ─────────────────
             import folium
@@ -928,8 +943,13 @@ with tab_eligibility:
                 for _, r in nearby.iterrows():
                     _rr = road_results.get(r["FAT_CODE"])
                     rd = _rr.get("road_distance_m") if isinstance(_rr, dict) else _rr
-                    rd_txt = f"{rd:.0f}m (jalan)" if rd is not None else "?"
-                    is_elig = rd is not None and rd <= RADIUS_M
+                    if rd is not None:
+                        rd_txt = f"{rd:.0f}m (jalan)"
+                        is_elig = rd <= RADIUS_M
+                    else:
+                        # OSRM mati/gagal: pakai jarak udara sebagai perkiraan.
+                        rd_txt = "jarak udara saja"
+                        is_elig = r["distance_m"] <= RADIUS_M
                     folium.Marker(
                         [r["lat"], r["lon"]],
                         tooltip=f"{r['FAT_CODE']} — udara {r['distance_m']:.0f}m | {rd_txt}",
