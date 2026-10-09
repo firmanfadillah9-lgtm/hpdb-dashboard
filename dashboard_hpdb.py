@@ -1537,7 +1537,21 @@ with tab_progress:
                                 f.write(chunk)
             if not os.path.exists(path):
                 return None
-            dfh = pd.read_parquet(path)
+            # File 17 MB ini menjadi 1.061 MB di memori kalau dimuat apa
+            # adanya -- ketujuh kolomnya bertipe object (objek string Python
+            # satu per satu). Plafon Streamlit Cloud sekitar 1 GB, jadi baris
+            # ini SENDIRIAN membunuh proses tanpa menyisakan traceback.
+            #
+            # Dimuat hanya 5 kolom yang dipakai tab ini (VENDOR_NAME dan
+            # CLUSTER_NAME tidak terpakai) dengan backend Arrow: 190 MB.
+            # Sudah diverifikasi: pivot, groupby, mask isin, dan jumlah baris
+            # identik dengan versi lama.
+            dfh = pd.read_parquet(
+                path,
+                columns=["HOMEPASS_ID", "status_from", "status_to",
+                         "change_date", "CITY"],
+                dtype_backend="pyarrow",
+            )
             dfh["change_date"] = pd.to_datetime(dfh["change_date"])
             dfh["status_from"] = dfh["status_from"].fillna("(BARU)")
             return dfh
