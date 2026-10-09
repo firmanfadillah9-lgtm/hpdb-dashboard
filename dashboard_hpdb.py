@@ -144,6 +144,7 @@ GITHUB_REPO  = "hpdb-dashboard"
 RELEASE_TAG  = "latest-data"
 ASSET_NAME   = "hpdb.parquet"
 LOCAL_CACHE  = "hpdb_cache.parquet"
+DIR_UNDUH    = "/tmp/hpdb_unduh"   # berkas unduhan sementara
 
 st.set_page_config(
     page_title="HPDB — Infrastructure Monitoring",
@@ -265,6 +266,11 @@ def get_connection():
     con.execute("SET memory_limit='500MB'")
     con.execute("SET threads=2")
     con.execute("SET temp_directory='/tmp/duckdb_spill'")
+    # Tanpa ini, COPY ... TO csv menahan hasil di memori demi menjaga urutan
+    # baris. Diukur pada 889.581 baris: 731 MB -> 211 MB puncak RAM.
+    # Urutan baris tidak dipakai di mana pun -- semua query yang peduli
+    # urutan sudah memakai ORDER BY sendiri.
+    con.execute("SET preserve_insertion_order=false")
     con.execute(f"CREATE VIEW hpdb AS SELECT * FROM read_parquet('{path}')")
     return con
 
@@ -357,6 +363,87 @@ def df_vendor_top(w: str):
 
 
 # ─── SIDEBAR ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Pengelompokan vendor.
+#
+# Tidak bisa diturunkan dari SOURCE_FILE: file B2S memuat vendor B2S DAN
+# Own Build sekaligus, sementara file G2A hanya LINKNET-F/H. Jadi grup
+# ditentukan dari VENDOR_NAME.
+# ---------------------------------------------------------------------------
+# Urutan kolom mengikuti berkas sumber .xlsb; dua terakhir turunan pipeline.
+HPDB_COLUMNS_URUT = [
+    "HOMEPASS_ID", "HOMEPASS_STATUS", "ACQUISITION_CLASS", "ACQUISITION_TIER",
+    "COMPETITION", "BUILDING_TYPE", "OWNERSHIP", "VENDOR_NAME", "REGION", "CITY",
+    "CITY_CODE", "PROJECT_NAME", "PROJECT_ID", "RESIDENCE_NAME", "CLUSTER_NAME",
+    "CLUSTER_CODE", "PREFIX_ADDRESS", "STREET_NAME", "HOUSE_NUMBER", "BLOCK",
+    "FLOOR", "RT", "RW", "DISTRICT", "SUB_DISTRICT", "ZIP_CODE", "OLT_LOCATION",
+    "OLT_LOCATION_CODE", "OLT_DEVICE_CODE", "OLT_NAME", "FDT_CODE", "FAT_CODE",
+    "FDT_LONGITUDE", "FDT_LATITUDE", "FAT_LONGITUDE", "FAT_LATITUDE",
+    "BUILDING_LATITUDE", "BUILDING_LONGITUDE", "NETWORK_ID", "FRAME", "SLOT",
+    "PORT", "IP_DEVICE", "VLAN_SERVICE", "RFS_DATE", "REMARKS", "MOBILE_REGION",
+    "MOBILE_CLUSTER", "PARTNER_RFS_DATE", "CITY_GROUP", "BUILDING_NAME", "COUNTER",
+    "FULL_ADDRESS", "SOURCE_FILE",
+]
+
+
+GRUP_VENDOR = {
+    "Own Build": ["EMR", "FIBERSTAR", "FIBERHOME", "HUAWEI", "ALITA"],
+    "B2S":       ["IFORTE", "LINKNET", "TBG"],
+    "G2A":       ["LINKNET-F", "LINKNET-H"],
+}
+
+
+def _quote_list(nilai):
+    """Rangkai daftar nilai jadi literal SQL yang aman dari tanda kutip."""
+    aman = [str(v).replace("'", "''") for v in nilai]
+    return "'" + "', '".join(aman) + "'"
+
+
+def tulis_xlsx_streaming(con, sel_sql, where, kolom, path, total, bar=None):
+    """Tulis hasil query ke .xlsx tanpa memuat seluruh data ke memori.
+
+    pandas.to_excel memakai openpyxl yang menyusun seluruh sheet sebagai
+    objek Python dulu: diukur 100.000 baris x 54 kolom = 1.147 MB puncak
+    RAM dan 63 detik. Di container 1 GB itu OOM.
+
+    xlsxwriter dengan constant_memory=True hanya menahan satu baris, dan
+    hasil DuckDB diambil per batch lewat Arrow. Diukur 50.000 baris =
+    252 MB puncak, 19,6 detik.
+    """
+    import xlsxwriter
+
+    wb = xlsxwriter.Workbook(path, {"constant_memory": True,
+                                    "in_memory": False})
+    try:
+        ws = wb.add_worksheet("HPDB")
+        f_hdr = wb.add_format({"bold": True, "bg_color": "#DDEBF7",
+                               "border": 1})
+        for j, nama in enumerate(kolom):
+            ws.write(0, j, nama, f_hdr)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, 0, len(kolom) - 1)
+
+        cur = con.cursor()
+        res = cur.execute(f"SELECT {sel_sql} FROM hpdb WHERE {where}")
+        reader = (res.to_arrow_reader(10_000)
+                  if hasattr(res, "to_arrow_reader")
+                  else res.fetch_record_batch(10_000))
+
+        r = 1
+        for batch in reader:
+            kolom_py = [c.to_pylist() for c in batch.columns]
+            for nilai in zip(*kolom_py):
+                ws.write_row(r, 0, ["" if v is None else v for v in nilai])
+                r += 1
+            del kolom_py
+            if bar is not None and total:
+                bar.progress(min(r / total, 1.0),
+                             text=f"Menulis Excel: {r-1:,} / {total:,} baris")
+    finally:
+        wb.close()
+    return r - 1
+
+
 with st.sidebar:
     st.markdown(f"**{st.session_state.get('user_name', '')}**")
     role_label = "👑 Super Admin" if st.session_state.get("user_role") == "super_admin" else "👤 Viewer"
@@ -367,8 +454,22 @@ with st.sidebar:
 
     st.title("🔍 Filter")
 
-    selected_region = st.selectbox("Region", opsi_distinct("REGION"))
-    selected_vendor = st.selectbox("Vendor", opsi_distinct("VENDOR_NAME"))
+    # Semua filter multi-pilih. Kosong = tidak menyaring (semua data).
+    _regions = [r for r in opsi_distinct("REGION") if r != "Semua"]
+    sel_region = st.multiselect("Region", _regions,
+                                placeholder="Semua region")
+
+    sel_group = st.multiselect("Group", list(GRUP_VENDOR),
+                               placeholder="Semua group")
+
+    # Daftar vendor menyesuaikan group yang dipilih, supaya tidak muncul
+    # kombinasi yang pasti kosong.
+    _vendors = [v for v in opsi_distinct("VENDOR_NAME") if v != "Semua"]
+    if sel_group:
+        _anggota = {v for g in sel_group for v in GRUP_VENDOR[g]}
+        _vendors = [v for v in _vendors if v in _anggota]
+    sel_vendor = st.multiselect("Vendor", _vendors,
+                                placeholder="Semua vendor")
 
     if st.button("🔄 Refresh Data"):
         if os.path.exists(LOCAL_CACHE):
@@ -379,10 +480,13 @@ with st.sidebar:
 
 # Build WHERE clause dari filter
 where_clauses = []
-if selected_region != "Semua":
-    where_clauses.append(f"REGION = '{selected_region}'")
-if selected_vendor != "Semua":
-    where_clauses.append(f"VENDOR_NAME = '{selected_vendor}'")
+if sel_region:
+    where_clauses.append(f"REGION IN ({_quote_list(sel_region)})")
+if sel_group:
+    _anggota_grup = [v for g in sel_group for v in GRUP_VENDOR[g]]
+    where_clauses.append(f"VENDOR_NAME IN ({_quote_list(_anggota_grup)})")
+if sel_vendor:
+    where_clauses.append(f"VENDOR_NAME IN ({_quote_list(sel_vendor)})")
 where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
 
@@ -644,6 +748,145 @@ with tab_overview:
                 f"Menampilkan {len(df_fat_points):,} titik lokasi FAT. "
                 f"Untuk cek radius 150m presisi pada satu titik, gunakan tab 'Cek Eligibilitas'."
             )
+
+
+    # -----------------------------------------------------------------------
+    # UNDUH DATA sesuai filter.
+    #
+    # Susunan kolom mengikuti berkas sumber .xlsb (52 kolom, HOMEPASS_ID
+    # sampai COUNTER). FULL_ADDRESS dan SOURCE_FILE adalah turunan pipeline
+    # kita sendiri, jadi dibuat opsional.
+    #
+    # Batas baris di bawah BUKAN angka karangan, tapi hasil ukur dengan
+    # dataset ini (7,58 juta baris x 54 kolom), tiap uji proses terpisah:
+    #
+    #   metode                        baris    puncak RAM   waktu    berkas
+    #   COPY ke CSV                 889.581       211 MB     1,8s   504 MB
+    #   arrow -> xlsxwriter          50.000       252 MB    19,6s   9,8 MB
+    #   pandas.to_excel (openpyxl)  100.000     1.147 MB    63,5s    19 MB
+    #
+    # Karena itu: CSV lewat COPY, Excel lewat xlsxwriter mode streaming,
+    # dan pandas.to_excel TIDAK dipakai sama sekali (jaminan OOM di
+    # Streamlit Cloud yang hanya punya ~1 GB).
+    #
+    # st.download_button memuat seluruh berkas ke RAM saat disajikan, jadi
+    # yang benar-benar membatasi adalah UKURAN berkas, bukan jumlah baris.
+    # BATAS_BERKAS_MB menjaga itu.
+    # -----------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("\U0001F4E5 Unduh Data (sesuai filter)")
+
+    KOLOM_ASLI = [c for c in HPDB_COLUMNS_URUT
+                  if c not in ("FULL_ADDRESS", "SOURCE_FILE")]
+
+    BATAS_BARIS = {"CSV": 500_000, "Excel (.xlsx)": 100_000, "Parquet": 10_000_000}
+    BATAS_BERKAS_MB = 320
+
+    st.caption(f"{total_rows:,} baris cocok dengan filter saat ini.")
+
+    _c1, _c2 = st.columns([2, 3])
+    with _c1:
+        _fmt = st.radio(
+            "Format", ["CSV", "Excel (.xlsx)", "Parquet"],
+            key="unduh_fmt",
+            help="CSV: cepat, langsung dibuka Excel. "
+                 "Excel: rapi tapi lambat, maksimal 100 ribu baris. "
+                 "Parquet: paling kecil, sanggup seluruh data, dibaca "
+                 "Excel lewat Power Query atau Python/DuckDB.")
+    with _c2:
+        _ikut = st.checkbox("Sertakan FULL_ADDRESS & SOURCE_FILE",
+                            value=False, key="unduh_turunan",
+                            help="Dua kolom ini tidak ada di berkas .xlsb asli.")
+        st.caption(
+            f"Batas: CSV {BATAS_BARIS['CSV']:,} baris  |  "
+            f"Excel {BATAS_BARIS['Excel (.xlsx)']:,} baris  |  "
+            f"Parquet seluruh data. Berkas maksimal {BATAS_BERKAS_MB} MB.")
+
+    _kolom = HPDB_COLUMNS_URUT if _ikut else KOLOM_ASLI
+    _batas = BATAS_BARIS[_fmt]
+
+    if total_rows == 0:
+        st.info("Tidak ada baris yang cocok dengan filter saat ini.")
+    elif total_rows > _batas:
+        st.warning(
+            f"Hasil filter {total_rows:,} baris, melebihi batas {_batas:,} "
+            f"untuk {_fmt}. Persempit filter, atau pilih Parquet yang "
+            f"sanggup seluruh data.")
+    else:
+        if st.button("Siapkan berkas", key="unduh_siapkan"):
+            _stamp = datetime.now().strftime("%Y%m%d_%H%M")
+            _ext = {"CSV": "csv", "Excel (.xlsx)": "xlsx",
+                    "Parquet": "parquet"}[_fmt]
+            _nama = f"HPDB_{_stamp}.{_ext}"
+            _path = os.path.join(DIR_UNDUH, _nama)
+            _sel = ", ".join(f'"{c}"' for c in _kolom)
+
+            os.makedirs(DIR_UNDUH, exist_ok=True)
+            # Buang berkas unduhan yang sudah lewat 30 menit supaya disk
+            # ephemeral tidak penuh. Batas umur, bukan hapus semua, supaya
+            # unduhan pengguna lain yang sedang jalan tidak ikut terhapus.
+            _sekarang = time.time()
+            for _lama in os.listdir(DIR_UNDUH):
+                _fl = os.path.join(DIR_UNDUH, _lama)
+                try:
+                    if _sekarang - os.path.getmtime(_fl) > 1800:
+                        os.remove(_fl)
+                except OSError:
+                    pass
+            st.session_state.pop("unduh_path", None)
+
+            _bar = st.progress(0.0, text=f"Menyiapkan {total_rows:,} baris...")
+            try:
+                if _fmt == "CSV":
+                    con.execute(f"COPY (SELECT {_sel} FROM hpdb WHERE "
+                                f"{where_sql}) TO '{_path}' "
+                                f"(HEADER, DELIMITER ',')")
+                    _bar.progress(1.0, text="Selesai")
+                elif _fmt == "Parquet":
+                    # ROW_GROUP_SIZE kecil menekan buffer kompresi.
+                    # Diukur 7,58 juta baris: default 683 MB / 36,2s ->
+                    # row group 30.000 jadi 360 MB / 11,9s, ukuran berkas
+                    # praktis sama (165,7 MB -> 171,1 MB).
+                    con.execute(f"COPY (SELECT {_sel} FROM hpdb WHERE "
+                                f"{where_sql}) TO '{_path}' "
+                                f"(FORMAT PARQUET, COMPRESSION ZSTD, "
+                                f"ROW_GROUP_SIZE 30000)")
+                    _bar.progress(1.0, text="Selesai")
+                else:
+                    tulis_xlsx_streaming(con, _sel, where_sql, _kolom,
+                                         _path, total_rows, _bar)
+
+                _mb = os.path.getsize(_path) / 1048576
+                if _mb > BATAS_BERKAS_MB:
+                    os.remove(_path)
+                    st.error(
+                        f"Berkas jadi {_mb:.0f} MB, di atas batas aman "
+                        f"{BATAS_BERKAS_MB} MB (tombol unduh memuat berkas "
+                        f"ke memori). Persempit filter, atau pilih Parquet.")
+                else:
+                    st.session_state["unduh_path"] = _path
+                    st.session_state["unduh_nama"] = _nama
+            except Exception as e:
+                st.error(f"Gagal menyiapkan berkas: {e}")
+                st.session_state.pop("unduh_path", None)
+            finally:
+                _bar.empty()
+
+        _p = st.session_state.get("unduh_path")
+        if _p and os.path.exists(_p):
+            _mb = os.path.getsize(_p) / 1048576
+            _nm = st.session_state["unduh_nama"]
+            _mime = {"csv": "text/csv",
+                     "xlsx": "application/vnd.openxmlformats-officedocument."
+                             "spreadsheetml.sheet",
+                     "parquet": "application/octet-stream"}[_nm.rsplit(".", 1)[1]]
+            with open(_p, "rb") as _f:
+                st.download_button(f"⬇️ Unduh {_nm} ({_mb:.1f} MB)",
+                                   data=_f, file_name=_nm, mime=_mime,
+                                   key="unduh_tombol")
+            st.caption(f"{len(_kolom)} kolom, susunan sama dengan berkas "
+                       f"HPDB_*.xlsb harian.")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
