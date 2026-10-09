@@ -13,6 +13,7 @@ Cara jalankan:
 
 import streamlit as st
 import pandas as pd
+import threading
 import duckdb
 import requests
 import os
@@ -229,7 +230,35 @@ def get_connection():
     return con
 
 
-con = get_connection()
+# ---------------------------------------------------------------------------
+# Pembungkus aman-thread untuk DuckDB.
+#
+# @st.cache_resource membagikan SATU objek koneksi ke semua sesi dan semua
+# thread, sementara Streamlit menjalankan tiap rerun di thread terpisah.
+# Pola con.execute(...).df() itu dua langkah: execute menaruh hasil di
+# koneksi, .df() mengambilnya. Kalau thread lain memanggil execute di antara
+# keduanya, hasilnya tertimpa -> .df() mengembalikan None (AttributeError),
+# dan pada kasus terburuk state internal DuckDB rusak -> segfault tanpa
+# traceback.
+#
+# Dengan memberi setiap query cursor-nya sendiri, tiap pemanggil punya
+# result set terpisah. Cursor DuckDB murah dan berbagi database yang sama.
+# ---------------------------------------------------------------------------
+class _DuckAmanThread:
+    def __init__(self, base):
+        self._base = base
+        self._kunci = threading.Lock()
+
+    def execute(self, *args, **kwargs):
+        with self._kunci:
+            cur = self._base.cursor()
+        return cur.execute(*args, **kwargs)
+
+    def __getattr__(self, nama):
+        return getattr(self._base, nama)
+
+
+con = _DuckAmanThread(get_connection())
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +512,7 @@ def get_coords_con():
             WHERE TRY_CAST(BUILDING_LATITUDE AS DOUBLE) IS NOT NULL
               AND TRY_CAST(BUILDING_LONGITUDE AS DOUBLE) IS NOT NULL
         """)
-        return coords_con, path
+        return _DuckAmanThread(coords_con), path
     except Exception as e:
         return None, None
 
