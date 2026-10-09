@@ -721,7 +721,14 @@ with tab_overview:
     st.markdown("---")
     st.subheader("🗺️ Peta Cakupan FAT (radius 150m)")
 
-    MAX_MAP_POINTS = 50_000
+    # Diukur pada data 8 Okt: SELECT DISTINCT FAT atas 7,58 juta baris
+    # tanpa filter = 804.431 titik / 688 MB puncak. Dengan filter jauh
+    # lebih murah: Own Build (191.558 FAT) 266 MB, satu vendor 157 MB.
+    # LIMIT tidak menolong karena DISTINCT harus selesai dulu baru LIMIT
+    # berlaku (tetap 387 MB), jadi ambang inilah pengamannya. Diturunkan
+    # dari 50.000 ke 20.000 karena tab Overview sendiri sudah memakai
+    # ~405 MB, dan peta 50 ribu titik juga sudah tak terbaca.
+    MAX_MAP_POINTS = 20_000
 
     # total_fat_points sudah ikut dihitung di metrik_overview(where_sql)
 
@@ -735,8 +742,8 @@ with tab_overview:
         )
     else:
         st.caption(f"{total_fat_points:,} FAT sesuai filter saat ini.")
-        show_map = st.checkbox("📍 Tampilkan peta", key="show_fat_map")
 
+        show_map = st.checkbox("📍 Tampilkan peta", key="show_fat_map")
         if show_map:
             @st.cache_data(ttl=3600, show_spinner="Memuat titik FAT...")
             def load_fat_points(where_sql):
@@ -752,11 +759,12 @@ with tab_overview:
                 """).df()
 
             df_fat_points = load_fat_points(where_sql)
-
-            st.map(df_fat_points, latitude="lat", longitude="lon", zoom=11, size=15)
+            st.map(df_fat_points, latitude="lat", longitude="lon",
+                   zoom=11, size=15)
             st.caption(
                 f"Menampilkan {len(df_fat_points):,} titik lokasi FAT. "
-                f"Untuk cek radius 150m presisi pada satu titik, gunakan tab 'Cek Eligibilitas'."
+                f"Untuk cek radius 150m presisi pada satu titik, gunakan "
+                f"tab 'Cek Eligibilitas'."
             )
 
 
@@ -2054,18 +2062,44 @@ with tab_progress:
             pv_show = pd.concat([pv, total_row])
             st.dataframe(pv_show, width="stretch", height=420)
 
-            import io as _io
-            _out = _io.BytesIO()
-            with pd.ExcelWriter(_out, engine="openpyxl") as _w:
-                pv_show.to_excel(_w, sheet_name="PerCity")
-                df_f.to_excel(_w, index=False, sheet_name="RawTransisi")
-            _out.seek(0)
-            st.download_button(
-                "⬇️ Download Laporan (Excel)", data=_out,
-                file_name=f"monthly_progress_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="mp_dl"
-            )
+            # Cacat yang sama dengan Dummy Monitor: st.download_button
+            # menyusun data-nya tiap rerun, jadi versi lama membangun ulang
+            # Excel berisi SELURUH df_f (transisi status mentah, ratusan
+            # ribu baris) setiap kali pengguna menyentuh widget mana pun --
+            # bahkan saat sedang membuka tab lain. Sekarang dua langkah.
+            st.caption(f"Pivot {len(pv_show):,} baris, transisi mentah "
+                       f"{len(df_f):,} baris.")
+            if st.button("Siapkan laporan Excel", key="mp_siapkan"):
+                os.makedirs(DIR_UNDUH, exist_ok=True)
+                _nmp = f"monthly_progress_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+                _ppm = os.path.join(DIR_UNDUH, _nmp)
+                try:
+                    with st.spinner("Menyusun laporan..."):
+                        with pd.ExcelWriter(_ppm, engine="xlsxwriter") as _w:
+                            pv_show.to_excel(_w, sheet_name="PerCity")
+                            # Transisi mentah dibatasi: lembar Excel sendiri
+                            # mentok di 1.048.576 baris, dan openpyxl/xlsxwriter
+                            # tetap berat jauh sebelum itu.
+                            df_f.head(200_000).to_excel(
+                                _w, index=False, sheet_name="RawTransisi")
+                    st.session_state["mp_path"] = _ppm
+                    st.session_state["mp_nama"] = _nmp
+                    if len(df_f) > 200_000:
+                        st.info(f"Lembar RawTransisi dipotong ke 200.000 baris "
+                                f"dari {len(df_f):,}.")
+                except Exception as ex:
+                    st.error(f"Gagal menyusun laporan: {ex}")
+                    st.session_state.pop("mp_path", None)
+
+            _pmp = st.session_state.get("mp_path")
+            if _pmp and os.path.exists(_pmp):
+                with open(_pmp, "rb") as _fh:
+                    st.download_button(
+                        f"⬇️ Unduh Laporan ({os.path.getsize(_pmp)/1048576:.1f} MB)",
+                        data=_fh, file_name=st.session_state["mp_nama"],
+                        mime="application/vnd.openxmlformats-officedocument."
+                             "spreadsheetml.sheet",
+                        key="mp_dl")
 
         with st.expander("ℹ️ Catatan definisi metrik"):
             st.markdown("""
@@ -2095,15 +2129,25 @@ with tab_dummy:
     _dummy_cond = " OR ".join([f"LOWER({f}) LIKE '%dummy%'" for f in DUMMY_FIELDS])
     _dummy_where = f"({_dummy_cond})"
 
-    # Metric cards
-    total_dummy = con.execute(f"SELECT COUNT(*) FROM hpdb WHERE {_dummy_where}").fetchone()[0]
-    total_all = con.execute("SELECT COUNT(*) FROM hpdb").fetchone()[0]
-    n_vendor = con.execute(
-        f"SELECT COUNT(DISTINCT VENDOR_NAME) FROM hpdb WHERE {_dummy_where}"
-    ).fetchone()[0]
-    n_active = con.execute(
-        f"SELECT COUNT(*) FROM hpdb WHERE {_dummy_where} AND UPPER(HOMEPASS_STATUS)='ASSIGNED'"
-    ).fetchone()[0]
+    # Semua agregat di bawah memindai 7,58 juta baris dengan 10 LIKE
+    # '%dummy%' sekaligus (~0,9 detik sekali jalan). Tanpa cache, enam
+    # query ini diulang SETIAP rerun -- termasuk saat pengguna sedang
+    # membuka tab lain, karena Streamlit menjalankan badan semua tab.
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _dummy_metrik(w):
+        return con.execute(f"""
+            SELECT COUNT(*) FILTER (WHERE {w}),
+                   COUNT(*),
+                   COUNT(DISTINCT VENDOR_NAME) FILTER (WHERE {w}),
+                   COUNT(*) FILTER (WHERE {w} AND UPPER(HOMEPASS_STATUS)='ASSIGNED')
+            FROM hpdb
+        """).fetchone()
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _dummy_agg(kunci, sql):
+        return con.execute(sql).fetchdf()
+
+    total_dummy, total_all, n_vendor, n_active = _dummy_metrik(_dummy_where)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("🎯 Total HPID Dummy", f"{total_dummy:,}")
@@ -2116,11 +2160,11 @@ with tab_dummy:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### Per Vendor")
-        df_vendor = con.execute(f"""
+        df_vendor = _dummy_agg("vendor", f"""
             SELECT COALESCE(VENDOR_NAME, '(kosong)') AS Vendor, COUNT(*) AS Jumlah
             FROM hpdb WHERE {_dummy_where}
             GROUP BY 1 ORDER BY 2 DESC
-        """).fetchdf()
+        """)
         st.dataframe(df_vendor, width="stretch", hide_index=True)
         if not df_vendor.empty:
             import plotly.express as px
@@ -2131,11 +2175,11 @@ with tab_dummy:
 
     with c2:
         st.markdown("#### Per Status")
-        df_status = con.execute(f"""
+        df_status = _dummy_agg("status", f"""
             SELECT HOMEPASS_STATUS AS Status, COUNT(*) AS Jumlah
             FROM hpdb WHERE {_dummy_where}
             GROUP BY 1 ORDER BY 2 DESC
-        """).fetchdf()
+        """)
         st.dataframe(df_status, width="stretch", hide_index=True)
         if not df_status.empty:
             import plotly.express as px
@@ -2145,19 +2189,17 @@ with tab_dummy:
 
     st.markdown("---")
     st.markdown("#### 🏙️ Per Kota (top 15)")
-    df_city = con.execute(f"""
+    df_city = _dummy_agg("kota", f"""
         SELECT CITY AS Kota, VENDOR_NAME AS Vendor, COUNT(*) AS Jumlah
         FROM hpdb WHERE {_dummy_where}
         GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 15
-    """).fetchdf()
+    """)
     st.dataframe(df_city, width="stretch", hide_index=True)
 
     st.markdown("---")
-    st.markdown("#### 📋 Daftar Lengkap HPID Dummy")
-    # Filter vendor opsional
-    _vendors_dummy = ["Semua"] + [r[0] for r in con.execute(
-        f"SELECT DISTINCT COALESCE(VENDOR_NAME,'(kosong)') FROM hpdb WHERE {_dummy_where} ORDER BY 1"
-    ).fetchall()]
+    st.markdown("#### 📋 Daftar HPID Dummy")
+
+    _vendors_dummy = ["Semua"] + list(df_vendor["Vendor"])
     _sel_v = st.selectbox("Filter vendor:", _vendors_dummy, key="dummy_vendor_filter")
     _extra = ""
     if _sel_v == "(kosong)":
@@ -2165,32 +2207,90 @@ with tab_dummy:
     elif _sel_v != "Semua":
         _extra = f" AND VENDOR_NAME = '{_sel_v}'"
 
+    _w_dummy = f"{_dummy_where}{_extra}"
+    _n_dummy = con.execute(f"SELECT COUNT(*) FROM hpdb WHERE {_w_dummy}").fetchone()[0]
+
+    # Pratinjau DIBATASI. Versi lama menarik seluruh 671.353 baris x 16
+    # kolom ke pandas lalu menulisnya jadi Excel di BytesIO -- itu meledak
+    # lewat 3,9 GB saat diukur, dan jadi OutOfMemoryException di cloud.
+    # Tidak ada yang menggulir 671 ribu baris di widget; yang butuh semua
+    # baris memakai tombol unduh di bawah.
+    PRATINJAU = 1_000
+    _kolom_dummy = ["HOMEPASS_ID", "VENDOR_NAME", "HOMEPASS_STATUS",
+                    "ACQUISITION_CLASS", "ACQUISITION_TIER", "REGION", "CITY",
+                    "CLUSTER_NAME", "PROJECT_NAME", "STREET_NAME", "FAT_CODE",
+                    "FDT_CODE", "OLT_LOCATION", "BUILDING_LATITUDE",
+                    "BUILDING_LONGITUDE", "REMARKS"]
+    _sel_dummy = ", ".join(f'"{c}"' for c in _kolom_dummy)
+
     df_list = con.execute(f"""
-        SELECT HOMEPASS_ID, VENDOR_NAME, HOMEPASS_STATUS,
-               ACQUISITION_CLASS, ACQUISITION_TIER,
-               REGION, CITY, CLUSTER_NAME, PROJECT_NAME, STREET_NAME,
-               FAT_CODE, FDT_CODE, OLT_LOCATION,
-               BUILDING_LATITUDE, BUILDING_LONGITUDE, REMARKS
-        FROM hpdb WHERE {_dummy_where}{_extra}
-        ORDER BY VENDOR_NAME, HOMEPASS_ID
+        SELECT {_sel_dummy} FROM hpdb WHERE {_w_dummy}
+        ORDER BY VENDOR_NAME, HOMEPASS_ID LIMIT {PRATINJAU}
     """).fetchdf()
-    st.caption(f"Menampilkan {len(df_list):,} HPID dummy.")
+    st.caption(f"{_n_dummy:,} HPID dummy cocok. Menampilkan {len(df_list):,} teratas "
+               f"— pakai tombol unduh untuk daftar penuh.")
     st.dataframe(df_list, width="stretch", height=420, hide_index=True)
 
-    # Download Excel
-    import io as _io
-    _out = _io.BytesIO()
-    with pd.ExcelWriter(_out, engine="openpyxl") as _w:
-        df_list.to_excel(_w, index=False, sheet_name="HPID_Dummy")
-        df_vendor.to_excel(_w, index=False, sheet_name="Per_Vendor")
-        df_city.to_excel(_w, index=False, sheet_name="Per_Kota")
-    _out.seek(0)
-    st.download_button(
-        "⬇️ Download Daftar Dummy (Excel)", data=_out,
-        file_name=f"dummy_hpid_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dummy_dl"
-    )
+    # Unduhan dua langkah: berkas baru dibuat setelah tombol ditekan.
+    # st.download_button menyusun data-nya di SETIAP rerun, jadi memberi
+    # dia hasil to_excel() langsung berarti Excel 671 ribu baris dibangun
+    # ulang tiap kali pengguna menyentuh widget apa pun di halaman ini.
+    _fd1, _fd2 = st.columns([2, 3])
+    with _fd1:
+        _fmt_d = st.radio("Format", ["CSV", "Excel (.xlsx)"], horizontal=True,
+                          key="dummy_fmt")
+    with _fd2:
+        st.caption("CSV untuk daftar penuh. Excel maksimal 100.000 baris "
+                   "karena penulisannya jauh lebih lambat dan berat.")
+
+    _batas_d = 2_000_000 if _fmt_d == "CSV" else 100_000
+    if _n_dummy == 0:
+        st.info("Tidak ada HPID dummy untuk filter ini.")
+    elif _n_dummy > _batas_d:
+        st.warning(f"{_n_dummy:,} baris melebihi batas {_batas_d:,} untuk "
+                   f"{_fmt_d}. Pilih CSV, atau persempit lewat filter vendor.")
+    else:
+        if st.button("Siapkan berkas", key="dummy_siapkan"):
+            os.makedirs(DIR_UNDUH, exist_ok=True)
+            _skr = time.time()
+            for _f in os.listdir(DIR_UNDUH):
+                try:
+                    if _skr - os.path.getmtime(os.path.join(DIR_UNDUH, _f)) > 1800:
+                        os.remove(os.path.join(DIR_UNDUH, _f))
+                except OSError:
+                    pass
+            st.session_state.pop("dummy_path", None)
+            _nm = (f"dummy_hpid_{datetime.now().strftime('%Y%m%d_%H%M')}."
+                   f"{'csv' if _fmt_d == 'CSV' else 'xlsx'}")
+            _pt = os.path.join(DIR_UNDUH, _nm)
+            _bd = st.progress(0.0, text=f"Menyiapkan {_n_dummy:,} baris...")
+            try:
+                if _fmt_d == "CSV":
+                    con.execute(f"COPY (SELECT {_sel_dummy} FROM hpdb WHERE "
+                                f"{_w_dummy}) TO '{_pt}' (HEADER, DELIMITER ',')")
+                    _bd.progress(1.0, text="Selesai")
+                else:
+                    tulis_xlsx_streaming(con, _sel_dummy, _w_dummy, _kolom_dummy,
+                                         _pt, _n_dummy, _bd)
+                st.session_state["dummy_path"] = _pt
+                st.session_state["dummy_nama"] = _nm
+            except Exception as ex:
+                st.error(f"Gagal menyiapkan berkas: {ex}")
+                st.session_state.pop("dummy_path", None)
+            finally:
+                _bd.empty()
+
+        _pdm = st.session_state.get("dummy_path")
+        if _pdm and os.path.exists(_pdm):
+            _mbd = os.path.getsize(_pdm) / 1048576
+            _nmd = st.session_state["dummy_nama"]
+            _mimed = ("text/csv" if _nmd.endswith(".csv") else
+                      "application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet")
+            with open(_pdm, "rb") as _fh:
+                st.download_button(f"⬇️ Unduh {_nmd} ({_mbd:.1f} MB)",
+                                   data=_fh, file_name=_nmd, mime=_mimed,
+                                   key="dummy_dl")
 
 
 # ─── METADATA ───────────────────────────────────────────────────────────────
