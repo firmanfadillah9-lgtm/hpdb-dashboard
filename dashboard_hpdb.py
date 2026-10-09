@@ -14,6 +14,7 @@ Cara jalankan:
 import streamlit as st
 import pandas as pd
 import threading
+import time
 import duckdb
 import requests
 import os
@@ -26,49 +27,92 @@ except Exception:
     OSRM_BASE = "https://router.project-osrm.org"  # fallback ke public server
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def osrm_nearest(lat, lon, profile="driving", timeout=4):
-    """Snap koordinat ke jalan terdekat. Return (lat, lon, snap_distance_m) atau (None, None, None)."""
+# ---------------------------------------------------------------------------
+# OSRM dengan ANGGARAN WAKTU.
+#
+# Satu pengecekan koordinat bisa memicu belasan permintaan HTTP berurutan.
+# Kalau server rute lambat atau mengabaikan permintaan (server demo publik
+# sering menolak IP datacenter), satu script run Streamlit terblokir sampai
+# puluhan detik, health check platform menyerah, dan app dibunuh tanpa
+# menyisakan traceback.
+#
+# Jadi SELURUH pemanggilan OSRM dalam satu script run dibatasi satu anggaran
+# waktu. Begitu habis, sisanya langsung menyerah tanpa menunggu. Hasil yang
+# BERHASIL disimpan di session_state; kegagalan sengaja TIDAK disimpan,
+# supaya satu gangguan sesaat tidak mematikan fitur ini seharian.
+# ---------------------------------------------------------------------------
+OSRM_ANGGARAN_S = 8.0      # total untuk semua panggilan dalam satu script run
+OSRM_PER_CALL_S = 2.5      # batas tiap permintaan
+
+
+def osrm_mulai_anggaran(detik: float = OSRM_ANGGARAN_S) -> None:
+    st.session_state["_osrm_batas"] = time.monotonic() + detik
+
+
+def _osrm_sisa() -> float:
+    return max(0.0, st.session_state.get("_osrm_batas", 0.0) - time.monotonic())
+
+
+def _osrm_cache() -> dict:
+    return st.session_state.setdefault("_osrm_cache", {})
+
+
+def _osrm_minta(path: str, params: dict | None = None):
+    """Satu permintaan OSRM, tunduk pada anggaran. None kalau menyerah."""
+    sisa = _osrm_sisa()
+    if sisa < 0.5:
+        return None
     try:
-        url = f"{OSRM_BASE}/nearest/v1/{profile}/{lon},{lat}"
-        resp = requests.get(url, timeout=timeout)
+        resp = requests.get(f"{OSRM_BASE}{path}", params=params,
+                            timeout=min(OSRM_PER_CALL_S, sisa))
         data = resp.json()
-        if data.get("code") == "Ok":
-            wp = data["waypoints"][0]
-            snapped_lon, snapped_lat = wp["location"]
-            return snapped_lat, snapped_lon, wp.get("distance", 0)
+        return data if data.get("code") == "Ok" else None
     except Exception:
-        pass
-    return None, None, None
+        return None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def osrm_route_distance(lat1, lon1, lat2, lon2, profile="driving", timeout=4):
-    """Hitung jarak rute jalan antara 2 titik (yang sudah di-snap). Return distance_m atau None."""
-    try:
-        url = f"{OSRM_BASE}/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}"
-        resp = requests.get(url, params={"overview": "false"}, timeout=timeout)
-        data = resp.json()
-        if data.get("code") == "Ok":
-            return data["routes"][0]["distance"]
-    except Exception:
-        pass
-    return None
+def osrm_nearest(lat, lon, profile="driving"):
+    """Snap koordinat ke jalan terdekat. (lat, lon, jarak_snap_m) atau (None, None, None)."""
+    kunci = ("n", profile, round(lat, 6), round(lon, 6))
+    c = _osrm_cache()
+    if kunci in c:
+        return c[kunci]
+    data = _osrm_minta(f"/nearest/v1/{profile}/{lon},{lat}")
+    if not data:
+        return None, None, None
+    wp = data["waypoints"][0]
+    slon, slat = wp["location"]
+    hasil = (slat, slon, wp.get("distance", 0))
+    c[kunci] = hasil
+    return hasil
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def osrm_route_geometry(lat1, lon1, lat2, lon2, profile="driving", timeout=4):
-    """Ambil geometri rute jalan (list [lat, lon]) antara 2 titik. Return list atau None."""
-    try:
-        url = f"{OSRM_BASE}/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}"
-        resp = requests.get(url, params={"overview": "full", "geometries": "geojson"}, timeout=timeout)
-        data = resp.json()
-        if data.get("code") == "Ok":
-            coords = data["routes"][0]["geometry"]["coordinates"]  # [[lon,lat],...]
-            return [[c[1], c[0]] for c in coords]
-    except Exception:
-        pass
-    return None
+def osrm_route_distance(lat1, lon1, lat2, lon2, profile="driving"):
+    """Jarak rute jalan antara 2 titik. Meter atau None."""
+    kunci = ("d", profile, round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
+    c = _osrm_cache()
+    if kunci in c:
+        return c[kunci]
+    data = _osrm_minta(f"/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}",
+                       {"overview": "false"})
+    if not data:
+        return None
+    c[kunci] = data["routes"][0]["distance"]
+    return c[kunci]
+
+
+def osrm_route_geometry(lat1, lon1, lat2, lon2, profile="driving"):
+    """Geometri rute jalan sebagai list [lat, lon], atau None."""
+    kunci = ("g", profile, round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
+    c = _osrm_cache()
+    if kunci in c:
+        return c[kunci]
+    data = _osrm_minta(f"/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}",
+                       {"overview": "full", "geometries": "geojson"})
+    if not data:
+        return None
+    c[kunci] = [[x[1], x[0]] for x in data["routes"][0]["geometry"]["coordinates"]]
+    return c[kunci]
 
 
 def calc_road_distance(cust_lat, cust_lon, fat_lat, fat_lon, profile="driving"):
@@ -895,12 +939,24 @@ with tab_eligibility:
             top_n = min(3, len(nearby)) if pakai_osrm else 0
             road_results = {}
             if top_n > 0:
+                # Seluruh panggilan OSRM di script run ini dibatasi 8 detik.
+                osrm_mulai_anggaran()
                 with st.spinner(f"Menghitung jarak jalan untuk {top_n} FAT terdekat..."):
                     for idx in range(top_n):
                         row = nearby.iloc[idx]
                         road_results[row["FAT_CODE"]] = calc_road_distance(
                             input_lat, input_lon, row["lat"], row["lon"]
                         )
+                _berhasil = sum(
+                    1 for v in road_results.values()
+                    if isinstance(v, dict) and v.get("road_distance_m") is not None
+                )
+                if _berhasil == 0:
+                    st.warning(
+                        "Server rute (OSRM) tidak merespons dalam batas waktu. "
+                        "Angka di bawah memakai jarak udara. Untuk jarak jalan yang "
+                        "andal, arahkan ke server sendiri lewat Secrets:  [osrm] url = \"...\""
+                    )
 
             # ─── PETA (Folium — satelit + marker interaktif) ─────────────────
             import folium
