@@ -1186,7 +1186,7 @@ with tab_eligibility:
             # dan jarak jalan dihitung hanya kalau diminta. Hasilnya
             # di-cache 24 jam, jadi pengecekan ulang titik yang sama gratis.
             pakai_osrm = st.checkbox(
-                "Hitung jarak jalan (OSRM) — lebih akurat, perlu beberapa detik",
+                "Hitung jarak jalan (OpenRouteService) — lebih akurat, perlu beberapa detik",
                 value=False, key="pakai_osrm",
             )
             top_n = min(3, len(nearby)) if pakai_osrm else 0
@@ -1218,17 +1218,39 @@ with tab_eligibility:
             fmap = folium.Map(
                 location=[input_lat, input_lon], zoom_start=18, max_zoom=21, tiles=None,
             )
-            # Satelit Esri: tile native hanya sampai z19 — di atas itu tile z19
-            # di-upscale (maxNativeZoom) supaya peta tidak jadi abu-abu kosong.
+            # Beberapa basemap, bisa diganti lewat kontrol di pojok kanan atas.
+            #
+            # Soal "Map data not yet available": itu BUKAN tile gagal, tapi
+            # gambar placeholder yang memang dikirim Esri saat citra satelit
+            # untuk petak itu habis di zoom lebih dangkal dari yang diminta.
+            # Dari sisi HTTP tile-nya sukses, jadi Leaflet tidak bisa
+            # mendeteksinya dan maxNativeZoom pun tidak menolong. Cakupan
+            # resolusi tinggi Esri di Indonesia tidak merata: Jakarta inti
+            # umumnya tajam sampai z19, pinggiran sering mentok z16-17.
+            # Jalan keluarnya manusia: ganti basemap.
             folium.TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri World Imagery", name="Satelit",
+                attr="Esri World Imagery", name="Satelit (Esri)",
                 max_zoom=21, max_native_zoom=19,
+            ).add_to(fmap)
+            # Esri Clarity: layanan citra beda, sering punya liputan lebih
+            # dalam di titik yang World Imagery-nya sudah habis.
+            folium.TileLayer(
+                tiles="https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri Clarity", name="Satelit HD (Clarity)",
+                max_zoom=21, max_native_zoom=20, overlay=False, show=False,
+            ).add_to(fmap)
+            # OpenStreetMap digambar dari vektor, jadi TIDAK PERNAH kosong
+            # sampai z19 dan menampilkan denah bangunan + nama jalan --
+            # justru lebih berguna saat citra satelitnya buram atau hilang.
+            folium.TileLayer(
+                tiles="OpenStreetMap", name="Peta Jalan (OSM)",
+                max_zoom=21, max_native_zoom=19, overlay=False, show=False,
             ).add_to(fmap)
             # Layer label jalan di atas satelit
             folium.TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri", name="Labels", overlay=True, control=False,
+                attr="Esri", name="Label jalan", overlay=True, control=True,
                 max_zoom=21, max_native_zoom=19,
             ).add_to(fmap)
 
@@ -1332,7 +1354,16 @@ with tab_eligibility:
             except Exception:
                 pass
 
+            folium.LayerControl(collapsed=True, position="topright").add_to(fmap)
+
             st_folium(fmap, use_container_width=True, height=450, returned_objects=[])
+            st.caption(
+                "Kalau citra satelit berubah jadi abu-abu bertuliskan *Map data "
+                "not yet available* saat di-zoom, itu batas liputan citra Esri "
+                "di titik tersebut — bukan error. Buka ikon layer di pojok kanan "
+                "atas peta, lalu pilih **Satelit HD (Clarity)** atau **Peta Jalan "
+                "(OSM)**; OSM digambar dari vektor jadi selalu ada sampai zoom penuh."
+            )
             st.caption(
                 "🔵 Rumah = koordinat yang dicek | 🟢 FAT eligible (road ≤150m) | "
                 "🔴 FAT di luar jangkauan | Lingkaran = radius 150m | "
@@ -1345,7 +1376,7 @@ with tab_eligibility:
             if road_results:
                 st.markdown("##### 🛣️ Jarak Jalan (Road Distance) vs Jarak Lurus (Air Distance)")
                 st.caption(
-                    "Road distance dihitung mengikuti jalan sebenarnya (via OSRM routing), "
+                    "Road distance dihitung mengikuti jalan sebenarnya (via OpenRouteService), "
                     "lebih akurat untuk estimasi tarikan kabel dibanding jarak garis lurus."
                 )
                 comp_rows = []
