@@ -78,6 +78,63 @@ def _haversine_m(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
+ESRI_IMAGERY = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                "World_Imagery/MapServer")
+ESRI_CLARITY = ("https://clarity.maptiles.arcgis.com/arcgis/rest/services/"
+                "World_Imagery/MapServer")
+ZOOM_AMAN = 17   # liputan Esri praktis selalu ada sampai z17 di Indonesia
+
+
+def _deg2tile(lat, lon, z):
+    """Koordinat lat/lon -> indeks tile XYZ pada zoom z."""
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    lat_r = math.radians(lat)
+    y = int((1.0 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+    return x, y
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def esri_zoom_terdalam(lat_bulat, lon_bulat, base=ESRI_IMAGERY):
+    """Zoom terdalam yang BENAR-BENAR punya citra di titik ini.
+
+    Kenapa perlu: saat citra untuk sebuah petak habis, Esri tidak
+    mengembalikan 404 — dia mengirim gambar abu-abu bertuliskan "Map data
+    not yet available" dengan HTTP 200. Leaflet menganggap itu tile sukses,
+    jadi maxNativeZoom yang dipatok terlalu dalam tetap menghasilkan layar
+    abu-abu. Endpoint /tilemap melaporkan ada-tidaknya tile di cache, jadi
+    bisa dipakai menentukan batas yang benar per lokasi.
+
+    Dipatok ke grid ~1 km (argumen sudah dibulatkan 2 desimal) dan di-cache
+    sehari, jadi paling banyak beberapa permintaan kecil per area per hari.
+    Gagal apa pun -> ZOOM_AMAN, supaya peta tidak pernah lebih buruk dari
+    sebelum ada pemeriksaan ini.
+
+    Diverifikasi 11 Okt 2026 di -6.905774, 106.981126 (Sukabumi), titik yang
+    memunculkan "Map data not yet available":
+
+        z20 -> 0    z19 -> 0    z18 -> 1    z17 -> 1    z16 -> 1
+
+    Jadi liputan di sana habis di z18, sementara kode lama mematok
+    maxNativeZoom=19 -- meleset satu tingkat, dan itu cukup untuk membuat
+    seluruh layar jadi abu-abu. Perhatikan jawabannya 0/1 (integer), bukan
+    true/false, tapi pemeriksaan truthiness di bawah menangani keduanya.
+    """
+    for z in range(20, ZOOM_AMAN - 1, -1):
+        x, y = _deg2tile(lat_bulat, lon_bulat, z)
+        try:
+            r = requests.get(f"{base}/tilemap/{z}/{y}/{x}/1/1", timeout=4)
+            if not r.ok:
+                continue
+            data = r.json().get("data")
+            if isinstance(data, list) and data and data[0]:
+                return z
+        except Exception:
+            return ZOOM_AMAN
+    return ZOOM_AMAN
+
+
+
 def ors_rute(lat1, lon1, lat2, lon2):
     """Satu permintaan ORS -> (jarak_rute_m, titik_rute). (None, None) kalau gagal."""
     kunci = (round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
@@ -1218,40 +1275,48 @@ with tab_eligibility:
             fmap = folium.Map(
                 location=[input_lat, input_lon], zoom_start=18, max_zoom=21, tiles=None,
             )
-            # Beberapa basemap, bisa diganti lewat kontrol di pojok kanan atas.
+            # Liputan citra Esri diperiksa dulu untuk titik ini.
             #
-            # Soal "Map data not yet available": itu BUKAN tile gagal, tapi
-            # gambar placeholder yang memang dikirim Esri saat citra satelit
-            # untuk petak itu habis di zoom lebih dangkal dari yang diminta.
-            # Dari sisi HTTP tile-nya sukses, jadi Leaflet tidak bisa
-            # mendeteksinya dan maxNativeZoom pun tidak menolong. Cakupan
-            # resolusi tinggi Esri di Indonesia tidak merata: Jakarta inti
-            # umumnya tajam sampai z19, pinggiran sering mentok z16-17.
-            # Jalan keluarnya manusia: ganti basemap.
+            # "Map data not yet available" BUKAN tile gagal: saat citra untuk
+            # sebuah petak habis, Esri tetap menjawab HTTP 200 dengan gambar
+            # abu-abu bertulisan itu. Leaflet menganggapnya sukses, jadi
+            # maxNativeZoom yang dipatok 19 secara buta tetap menghasilkan
+            # layar abu-abu di daerah yang citranya cuma sampai z16-17 --
+            # dan di Indonesia itu kebanyakan daerah rural.
+            #
+            # Jadi batasnya ditanyakan per lokasi, lalu tile terdalam yang
+            # BENAR-BENAR ada di-upscale oleh Leaflet: buram saat zoom jauh,
+            # tapi tidak pernah kosong.
+            _znat = esri_zoom_terdalam(round(input_lat, 2), round(input_lon, 2))
+            _znat_hd = esri_zoom_terdalam(round(input_lat, 2), round(input_lon, 2),
+                                          base=ESRI_CLARITY)
+            # Kalau citra satelitnya memang dangkal, OSM yang jadi tampilan
+            # awal -- digambar dari vektor, jadi selalu tajam sampai z19.
+            _satelit_tipis = max(_znat, _znat_hd) < 18
+
             folium.TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                tiles=ESRI_IMAGERY + "/tile/{z}/{y}/{x}",
                 attr="Esri World Imagery", name="Satelit (Esri)",
-                max_zoom=21, max_native_zoom=19,
+                max_zoom=21, max_native_zoom=_znat,
+                overlay=False, show=not _satelit_tipis,
             ).add_to(fmap)
-            # Esri Clarity: layanan citra beda, sering punya liputan lebih
-            # dalam di titik yang World Imagery-nya sudah habis.
             folium.TileLayer(
-                tiles="https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                tiles=ESRI_CLARITY + "/tile/{z}/{y}/{x}",
                 attr="Esri Clarity", name="Satelit HD (Clarity)",
-                max_zoom=21, max_native_zoom=20, overlay=False, show=False,
+                max_zoom=21, max_native_zoom=_znat_hd,
+                overlay=False, show=False,
             ).add_to(fmap)
-            # OpenStreetMap digambar dari vektor, jadi TIDAK PERNAH kosong
-            # sampai z19 dan menampilkan denah bangunan + nama jalan --
-            # justru lebih berguna saat citra satelitnya buram atau hilang.
             folium.TileLayer(
                 tiles="OpenStreetMap", name="Peta Jalan (OSM)",
-                max_zoom=21, max_native_zoom=19, overlay=False, show=False,
-            ).add_to(fmap)
-            # Layer label jalan di atas satelit
-            folium.TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri", name="Label jalan", overlay=True, control=True,
                 max_zoom=21, max_native_zoom=19,
+                overlay=False, show=_satelit_tipis,
+            ).add_to(fmap)
+            folium.TileLayer(
+                tiles=("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                       "Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"),
+                attr="Esri", name="Label jalan", overlay=True, control=True,
+                max_zoom=21, max_native_zoom=min(_znat, 19),
+                show=not _satelit_tipis,
             ).add_to(fmap)
 
             # Titik input (biru)
@@ -1357,13 +1422,20 @@ with tab_eligibility:
             folium.LayerControl(collapsed=True, position="topright").add_to(fmap)
 
             st_folium(fmap, use_container_width=True, height=450, returned_objects=[])
-            st.caption(
-                "Kalau citra satelit berubah jadi abu-abu bertuliskan *Map data "
-                "not yet available* saat di-zoom, itu batas liputan citra Esri "
-                "di titik tersebut — bukan error. Buka ikon layer di pojok kanan "
-                "atas peta, lalu pilih **Satelit HD (Clarity)** atau **Peta Jalan "
-                "(OSM)**; OSM digambar dari vektor jadi selalu ada sampai zoom penuh."
-            )
+            if _satelit_tipis:
+                st.caption(
+                    f"Citra satelit di titik ini hanya tersedia sampai zoom "
+                    f"{max(_znat, _znat_hd)}, jadi peta dibuka dengan **Peta Jalan "
+                    f"(OSM)** yang tetap tajam sampai zoom penuh. Ganti ke satelit "
+                    f"lewat ikon layer di pojok kanan atas kalau perlu."
+                )
+            else:
+                st.caption(
+                    f"Citra satelit tersedia sampai zoom {_znat} "
+                    f"(Clarity: {_znat_hd}). Di atas itu tampilan diperbesar dari "
+                    f"tile terdalam, jadi memburam tapi tidak pernah kosong. "
+                    f"Ikon layer di pojok kanan atas untuk ganti basemap."
+                )
             st.caption(
                 "🔵 Rumah = koordinat yang dicek | 🟢 FAT eligible (road ≤150m) | "
                 "🔴 FAT di luar jangkauan | Lingkaran = radius 150m | "
