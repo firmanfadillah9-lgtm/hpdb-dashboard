@@ -463,6 +463,45 @@ def _quote_list(nilai):
     return "'" + "', '".join(aman) + "'"
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def alamat_hpid(ids_tuple):
+    """Ambil HOUSE_NUMBER + STREET_NAME untuk sekumpulan HPID.
+
+    Kenapa lewat tabel utama, bukan file coords: hpdb_coords_bulk.parquet
+    hanya memuat HOMEPASS_ID, HOMEPASS_STATUS, BUILDING_LAT/LON, FAT_CODE,
+    VENDOR_NAME, CLUSTER_NAME -- tidak ada kolom alamat. Menambah dua kolom
+    ke file itu berarti mengubah pipeline di repo homepass + upload ulang
+    asset ~59 MB; sementara lookup ke tabel utama yang sudah termuat cuma
+    perlu 0,5 detik untuk ratusan ID (diukur: 117 baris, 0,50s).
+
+    Hasil dipatok ke cache 1 jam supaya pengecekan ulang koordinat yang
+    sama tidak menembak query lagi.
+    """
+    if not ids_tuple:
+        return {}
+    daftar = ", ".join("'" + str(i).replace("'", "''") + "'" for i in ids_tuple)
+    try:
+        df = con.execute(f"""
+            SELECT HOMEPASS_ID, HOUSE_NUMBER, STREET_NAME
+            FROM hpdb WHERE HOMEPASS_ID IN ({daftar})
+        """).df()
+    except Exception:
+        return {}
+    hasil = {}
+    for _, r in df.iterrows():
+        nomor = str(r["HOUSE_NUMBER"] or "").strip()
+        jalan = str(r["STREET_NAME"] or "").strip()
+        # STREET_NAME bernilai '-' pada 1.438.758 baris (19%). Itu yang
+        # bikin label di Google Earth jadi '?-97'. Diperlakukan sebagai
+        # kosong, bukan dicetak apa adanya.
+        if jalan in ("-", "0", "NULL"):
+            jalan = ""
+        if nomor in ("-", "0", "NULL"):
+            nomor = ""
+        hasil[str(r["HOMEPASS_ID"])] = (nomor, jalan)
+    return hasil
+
+
 def tulis_xlsx_streaming(con, sel_sql, where, kolom, path, total, bar=None):
     """Tulis hasil query ke .xlsx tanpa memuat seluruh data ke memori.
 
@@ -1362,6 +1401,28 @@ with tab_eligibility:
                             icon="wifi", prefix="fa",
                         ),
                     ).add_to(fmap)
+
+                    # Label kode FAT di sebelah marker, seperti tampilan
+                    # Google Earth tim planning. Ikut FeatureGroup label
+                    # supaya bisa dimatikan bersama nomor rumah.
+                    _fat_lbl = str(r["FAT_CODE"])
+                    folium.Marker(
+                        [r["lat"], r["lon"]],
+                        icon=folium.DivIcon(
+                            icon_size=(0, 0), icon_anchor=(-12, 2),
+                            html=(
+                                '<div style="font:700 10px/1 '
+                                'system-ui,sans-serif;color:#fff;'
+                                'white-space:nowrap;'
+                                'text-shadow:0 0 3px #000,0 0 3px #000,'
+                                '1px 1px 2px #000;">'
+                                f'{_fat_lbl}<br>'
+                                f'<span style="font-weight:400">{rd_txt}</span>'
+                                '</div>'
+                            ),
+                        ),
+                    ).add_to(fmap)
+
                     # Garis input -> FAT untuk 5 terdekat: MENGIKUTI JALAN (OSRM route)
                     if r["FAT_CODE"] in road_results:
                         _clr = "#2ecc71" if is_elig else "#e74c3c"
@@ -1381,6 +1442,22 @@ with tab_eligibility:
                                 [[input_lat, input_lon], [r["lat"], r["lon"]]],
                                 color=_clr, weight=2, opacity=0.7, dash_array="6",
                             ).add_to(fmap)
+
+            # Kotak penanda rumah yang sedang dinilai -- padanan kotak hijau
+            # "Cs" di tampilan Google Earth tim planning. Digambar dari
+            # koordinat input, BUKAN dari dataset building footprint:
+            # footprint tidak menambah informasi apa pun karena sumber nomor
+            # rumah adalah HPDB sendiri, dan tidak ada dataset alamat terbuka
+            # untuk Indonesia (Overture addresses: 41 negara, tanpa Indonesia).
+            _sisi_m = 10.0
+            _d_lat = _sisi_m / 111_320.0
+            _d_lon = _sisi_m / (111_320.0 * max(0.1, math.cos(math.radians(input_lat))))
+            folium.Rectangle(
+                [[input_lat - _d_lat, input_lon - _d_lon],
+                 [input_lat + _d_lat, input_lon + _d_lon]],
+                color="#00E676", weight=3, fill=True, fill_opacity=0.12,
+                tooltip="Rumah calon pelanggan (titik yang dicek)",
+            ).add_to(fmap)
 
             # Titik HPID existing dalam radius 150m (dot kecil, warna per status)
             try:
@@ -1407,15 +1484,62 @@ with tab_eligibility:
                         "RESERVED": "#f39c12", "AGING": "#95a5a6",
                         "NOT_AVAILABLE": "#e74c3c",
                     }
+
+                    # Nomor rumah diambil dari tabel utama. File coords tidak
+                    # punya kolom alamat, jadi di-join per HPID di sini.
+                    # Tidak semua ketemu: coords digenerate dari snapshot yang
+                    # bisa lebih baru/lama dari hpdb.parquet, jadi beberapa
+                    # HPID tidak punya pasangan. Yang begitu tetap digambar
+                    # titiknya, hanya tanpa label.
+                    BATAS_LABEL = 200
+                    _alamat = alamat_hpid(tuple(_df_hp["HOMEPASS_ID"].astype(str)))
+
+                    # Label ditaruh di FeatureGroup sendiri supaya bisa
+                    # dimatikan lewat LayerControl saat areanya padat.
+                    _grup_label = folium.FeatureGroup(name="Nomor rumah", show=True)
+                    _n_label = 0
+
                     for _, h in _df_hp.iterrows():
                         _st = str(h["HOMEPASS_STATUS"]).upper()
+                        _hid = str(h["HOMEPASS_ID"])
+                        _nomor, _jalan = _alamat.get(_hid, ("", ""))
+                        _warna = _status_color.get(_st, "#7f8c8d")
+
+                        _judul = f"{_hid} — {_st} ({h['dist_m']:.0f}m)"
+                        if _nomor:
+                            _judul = (f"No. {_nomor}"
+                                      + (f", {_jalan}" if _jalan else "")
+                                      + f"<br>{_judul}")
+
                         folium.CircleMarker(
                             [float(h["blat"]), float(h["blon"])],
-                            radius=4,
-                            color=_status_color.get(_st, "#7f8c8d"),
+                            radius=4, color=_warna,
                             fill=True, fill_opacity=0.9, weight=1,
-                            tooltip=f"{h['HOMEPASS_ID']} — {_st} ({h['dist_m']:.0f}m)",
+                            tooltip=_judul,
                         ).add_to(fmap)
+
+                        if _nomor and _n_label < BATAS_LABEL:
+                            # text-shadow dipakai sebagai outline supaya teks
+                            # tetap terbaca di atas citra satelit yang gelap
+                            # maupun terang.
+                            folium.Marker(
+                                [float(h["blat"]), float(h["blon"])],
+                                icon=folium.DivIcon(
+                                    icon_size=(0, 0), icon_anchor=(-6, 7),
+                                    html=(
+                                        '<div style="font:700 11px/1 '
+                                        'system-ui,sans-serif;color:#fff;'
+                                        'white-space:nowrap;'
+                                        'text-shadow:0 0 3px #000,0 0 3px #000,'
+                                        '1px 1px 2px #000;">'
+                                        f'{_nomor}</div>'
+                                    ),
+                                ),
+                                tooltip=_judul,
+                            ).add_to(_grup_label)
+                            _n_label += 1
+
+                    _grup_label.add_to(fmap)
             except Exception:
                 pass
 
@@ -1561,7 +1685,11 @@ with tab_eligibility:
                         WHERE blat BETWEEN ? AND ?
                           AND blon BETWEEN ? AND ?
                         ORDER BY dist_m
-                        LIMIT 10
+                        -- Dinaikkan dari 10: untuk melabeli satu radius 150 m
+                        -- sepuluh terlalu sedikit (area uji Cipinang Muara
+                        -- saja 117 HPID), dan caption "N HPID terdekat"
+                        -- jadi menyesatkan karena hasilnya diam-diam ter-cap.
+                        LIMIT 300
                     """, [
                         input_lat, input_lon, input_lat,
                         input_lat - HPID_SNAP_DEG, input_lat + HPID_SNAP_DEG,
@@ -1609,8 +1737,21 @@ with tab_eligibility:
                         df_hpid_display = df_hpid_nearby[
                             ["HOMEPASS_ID", "HOMEPASS_STATUS", "FAT_CODE", "VENDOR_NAME", "dist_m"]
                         ].copy()
+                        # Nomor rumah & jalan dari tabel utama (file coords
+                        # tidak menyimpannya). Ikut ter-cache sejam.
+                        _al = alamat_hpid(tuple(df_hpid_display["HOMEPASS_ID"].astype(str)))
+                        df_hpid_display["No. Rumah"] = [
+                            _al.get(str(x), ("", ""))[0] for x in df_hpid_display["HOMEPASS_ID"]
+                        ]
+                        df_hpid_display["Jalan"] = [
+                            _al.get(str(x), ("", ""))[1] for x in df_hpid_display["HOMEPASS_ID"]
+                        ]
                         df_hpid_display["dist_m"] = df_hpid_display["dist_m"].round(1)
-                        df_hpid_display.columns = ["HPID", "Status", "FAT", "Vendor", "Jarak (m)"]
+                        df_hpid_display = df_hpid_display[[
+                            "HOMEPASS_ID", "No. Rumah", "Jalan", "HOMEPASS_STATUS",
+                            "FAT_CODE", "VENDOR_NAME", "dist_m"]]
+                        df_hpid_display.columns = ["HPID", "No. Rumah", "Jalan",
+                                                   "Status", "FAT", "Vendor", "Jarak (m)"]
                         st.dataframe(
                             df_hpid_display,
                             width="stretch",
