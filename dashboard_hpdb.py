@@ -12,6 +12,9 @@ Cara jalankan:
 """
 
 import streamlit as st
+# Import eksplisit: st.components.v1 adalah atribut implisit yang
+# kebetulan terisi saat paket dimuat, bukan API yang dijamin.
+import streamlit.components.v1 as st_components
 import pandas as pd
 import threading
 import math
@@ -55,6 +58,72 @@ def _ors_key() -> str:
         return st.secrets["ors"]["key"]
     except Exception:
         return ""
+
+
+def _gmaps_key() -> str:
+    """API key Google Maps untuk panorama Street View tertanam.
+
+    Opsional. Tanpa key, dashboard tetap menyediakan tautan Street View yang
+    membuka tab baru -- tautan itu tidak butuh key sama sekali.
+
+    Kenapa pakai Maps EMBED API, bukan Street View Static API:
+    Embed API tidak menagih dan tidak punya batas kuota harian, sedangkan
+    Static API menagih per gambar di atas jatah bulanan. Satu-satunya syarat
+    Embed API adalah API key, dan Google Maps Platform mewajibkan billing
+    account aktif walau API ini sendiri nol rupiah.
+
+    Amankan key-nya: batasi HANYA ke "Maps Embed API" di Google Cloud
+    Console (API restrictions), dan batasi juga ke domain Streamlit kamu
+    (HTTP referrer). Tanpa itu, key yang bocor bisa dipakai memanggil API
+    Google lain yang BERBAYAR.
+    """
+    try:
+        return st.secrets["gmaps"]["key"]
+    except Exception:
+        return ""
+
+
+def streetview_url(lat, lon, heading=None, fov=90, radius=50) -> str:
+    """URL iframe panorama Street View. Kosong kalau key belum diisi."""
+    key = _gmaps_key()
+    if not key:
+        return ""
+    u = (f"https://www.google.com/maps/embed/v1/streetview?key={key}"
+         f"&location={lat},{lon}&fov={fov}&radius={radius}")
+    if heading is not None:
+        u += f"&heading={heading:.0f}"
+    return u
+
+
+def streetview_tautan(lat, lon, heading=None, pitch=None, fov=None) -> str:
+    """Tautan Street View -- TANPA API key, TANPA billing account.
+
+    Maps URLs API mendukung heading/pitch/fov untuk map_action=pano dan
+    secara eksplisit tidak memerlukan API key. Jadi perilaku "kamera sudah
+    menghadap arah yang benar" tetap didapat tanpa biaya dan tanpa kartu
+    kredit -- bedanya cuma membuka tab baru, bukan tertanam di halaman.
+
+    Praktisnya ini malah lebih lega: Street View penuh di tab sendiri bisa
+    dinavigasi bebas, sementara iframe 380 px terasa sempit.
+    """
+    u = (f"https://www.google.com/maps/@?api=1&map_action=pano"
+         f"&viewpoint={lat},{lon}")
+    if heading is not None:
+        u += f"&heading={heading:.0f}"
+    if pitch is not None:
+        u += f"&pitch={pitch:.0f}"
+    if fov is not None:
+        u += f"&fov={fov:.0f}"
+    return u
+
+
+def arah_kompas(lat1, lon1, lat2, lon2) -> float:
+    """Bearing dari titik 1 ke titik 2, derajat searah jarum jam dari Utara."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
 
 
 def rute_mulai_anggaran(detik: float = ANGGARAN_RUTE_S) -> None:
@@ -1546,6 +1615,46 @@ with tab_eligibility:
             folium.LayerControl(collapsed=True, position="topright").add_to(fmap)
 
             st_folium(fmap, use_container_width=True, height=450, returned_objects=[])
+
+            # ── STREET VIEW ────────────────────────────────────────────────
+            # Dua jalur, dipilih otomatis:
+            #   ada key  -> panorama tertanam lewat Maps Embed API (gratis,
+            #               tanpa batas kuota harian)
+            #   tanpa key-> tombol yang membuka Street View di tab baru
+            #               (tidak butuh key maupun billing sama sekali)
+            # Jadi fitur ini tidak pernah "rusak" kalau key belum diisi.
+            st.markdown("##### \U0001F3D8\uFE0F Street View")
+
+            # Arah pandang diarahkan ke FAT terdekat, bukan default. Surveyor
+            # biasanya ingin melihat sisi rumah yang menghadap jalur kabel.
+            _sv_heading = None
+            if not nearby.empty:
+                _f0 = nearby.iloc[0]
+                _sv_heading = arah_kompas(input_lat, input_lon,
+                                          float(_f0["lat"]), float(_f0["lon"]))
+
+            _sv_src = streetview_url(input_lat, input_lon,
+                                     heading=_sv_heading, radius=60)
+            _sv_tautan = streetview_tautan(input_lat, input_lon,
+                                           heading=_sv_heading, pitch=0)
+            if _sv_src:
+                st_components.iframe(_sv_src, height=380)
+                _ket = "Panorama terdekat dalam radius 60 m dari titik yang dicek."
+                if _sv_heading is not None:
+                    _ket += (f" Kamera menghadap {_sv_heading:.0f}\u00B0 "
+                             f"(arah FAT {_f0['FAT_CODE']}).")
+                st.caption(_ket + " Layar abu-abu berarti mobil Street View "
+                           "belum pernah melewati titik ini.")
+                st.link_button("\U0001F517 Buka di Google Maps", _sv_tautan)
+            else:
+                st.link_button("\U0001F3D8\uFE0F Buka Street View di Google Maps",
+                               _sv_tautan, type="primary")
+                _ket = "Terbuka di tab baru. Tidak butuh API key maupun billing."
+                if _sv_heading is not None:
+                    _ket += (f" Kamera langsung menghadap {_sv_heading:.0f}\u00B0, "
+                             f"arah FAT {_f0['FAT_CODE']}.")
+                st.caption(_ket)
+
             if _satelit_tipis:
                 st.caption(
                     f"Citra satelit di titik ini hanya tersedia sampai zoom "
