@@ -533,6 +533,59 @@ def _quote_list(nilai):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def hpid_alamat_bbox(lat, lon, deg=0.0015):
+    """Semua HPID dalam bounding box, LANGSUNG dari tabel utama.
+
+    Sengaja TIDAK lewat hpdb_coords_bulk.parquet. File itu punya titik buta
+    serius: 6.088.201 baris vs 7.581.901 di HPDB -- 1,49 juta baris (19,7%)
+    tidak ada di sana. Yang paling parah EMR: cuma 33.279 dari 1.198.829
+    yang masuk, jadi 97,2% record EMR tak terlihat.
+
+    Untuk peta dan hitung jarak itu tidak masalah (yang hilang hampir
+    semuanya NOT_AVAILABLE). Tapi untuk menjawab "apakah alamat ini sudah
+    punya HPID", memakai file itu berarti menjawab dari data yang bolong.
+
+    Diukur: bbox langsung ke hpdb 1,2 detik / 205 MB puncak -- justru lebih
+    cepat daripada jalur coords (2,5 detik), dan ter-cache sejam.
+    """
+    try:
+        return con.execute(f"""
+            SELECT HOMEPASS_ID, HOUSE_NUMBER, STREET_NAME, BLOCK, RT, RW,
+                   CLUSTER_NAME, HOMEPASS_STATUS, FAT_CODE, VENDOR_NAME,
+                   6371000 * acos(LEAST(1.0, GREATEST(-1.0,
+                     cos(radians({lat})) * cos(radians(TRY_CAST(BUILDING_LATITUDE AS DOUBLE))) *
+                     cos(radians(TRY_CAST(BUILDING_LONGITUDE AS DOUBLE)) - radians({lon})) +
+                     sin(radians({lat})) * sin(radians(TRY_CAST(BUILDING_LATITUDE AS DOUBLE)))
+                   ))) AS dist_m
+            FROM hpdb
+            WHERE TRY_CAST(BUILDING_LATITUDE AS DOUBLE) BETWEEN {lat - deg} AND {lat + deg}
+              AND TRY_CAST(BUILDING_LONGITUDE AS DOUBLE) BETWEEN {lon - deg} AND {lon + deg}
+        """).df()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def df_alamat_hpid(ids_tuple):
+    """Detail alamat lengkap untuk sekumpulan HPID, sebagai DataFrame.
+
+    Dipakai untuk mencocokkan Block/No. Rumah pada HPID yang SUDAH terjaring
+    radius -- bukan pencarian global. Jadi daftar ID-nya selalu kecil
+    (ratusan), dan query-nya murah (diukur: 117 baris, 0,50 detik).
+    """
+    if not ids_tuple:
+        return pd.DataFrame()
+    daftar = ", ".join("'" + str(i).replace("'", "''") + "'" for i in ids_tuple)
+    try:
+        return con.execute(f"""
+            SELECT HOMEPASS_ID, HOUSE_NUMBER, STREET_NAME, BLOCK, RT, RW,
+                   CLUSTER_NAME, HOMEPASS_STATUS, FAT_CODE, VENDOR_NAME
+            FROM hpdb WHERE HOMEPASS_ID IN ({daftar})
+        """).df()
+    except Exception:
+        return pd.DataFrame()
+
+
 def alamat_hpid(ids_tuple):
     """Ambil HOUSE_NUMBER + STREET_NAME untuk sekumpulan HPID.
 
@@ -546,15 +599,8 @@ def alamat_hpid(ids_tuple):
     Hasil dipatok ke cache 1 jam supaya pengecekan ulang koordinat yang
     sama tidak menembak query lagi.
     """
-    if not ids_tuple:
-        return {}
-    daftar = ", ".join("'" + str(i).replace("'", "''") + "'" for i in ids_tuple)
-    try:
-        df = con.execute(f"""
-            SELECT HOMEPASS_ID, HOUSE_NUMBER, STREET_NAME
-            FROM hpdb WHERE HOMEPASS_ID IN ({daftar})
-        """).df()
-    except Exception:
+    df = df_alamat_hpid(ids_tuple)
+    if df.empty:
         return {}
     hasil = {}
     for _, r in df.iterrows():
@@ -1874,6 +1920,143 @@ with tab_eligibility:
                                 "Jarak (m)": st.column_config.NumberColumn("Jarak (m)", format="%.1f"),
                             }
                         )
+
+                        # ── COCOKKAN ALAMAT DI DALAM RADIUS ──────────────
+                        # Aturan "Aktivasi HPID" yang sudah ada memakai
+                        # radius 3 m. Itu terlalu ketat kalau pin sales
+                        # meleset -- GPS ponsel biasa melenceng 5-15 m, dan
+                        # koordinat EMR di HPDB dibulatkan 4 desimal (~11 m).
+                        # Jadi di sini rumahnya dicocokkan lewat IDENTITAS
+                        # ALAMAT (Block + No. Rumah), tapi tetap dibatasi
+                        # pada HPID yang sudah terjaring radius 150 m --
+                        # bukan pencarian global.
+                        st.markdown("---")
+                        st.markdown("**🏷️ Cocokkan alamat di dalam radius ini**")
+                        st.caption(
+                            "Isi Block dan No. Rumah dari form pengajuan untuk "
+                            "memastikan rumah itu memang sudah punya HPID — "
+                            "terutama yang berstatus ASSIGNED (siap diaktivasi, "
+                            "tidak perlu Add Homepass)."
+                        )
+                        _ea1, _ea2, _ea3, _ea4 = st.columns(4)
+                        with _ea1:
+                            _ea_blok = st.text_input("Block", key="el_blok",
+                                                     placeholder="B4")
+                        with _ea2:
+                            _ea_rumah = st.text_input("No. Rumah", key="el_rumah",
+                                                      placeholder="01")
+                        with _ea3:
+                            _ea_rt = st.text_input("RT (opsional)", key="el_rt",
+                                                   placeholder="005")
+                        with _ea4:
+                            _ea_rw = st.text_input("RW (opsional)", key="el_rw",
+                                                   placeholder="03")
+
+                        if _ea_blok.strip() or _ea_rumah.strip():
+                            _dfa = hpid_alamat_bbox(input_lat, input_lon)
+                            _dfa = _dfa[_dfa["dist_m"] <= 150] if not _dfa.empty else _dfa
+                            if _dfa.empty:
+                                st.warning("Detail alamat tidak bisa diambil "
+                                           "untuk radius ini.")
+                            else:
+                                def _nm(v):
+                                    v = str(v or "").upper().strip().lstrip("0")
+                                    return v if v else "0"
+
+                                _m = pd.Series(True, index=_dfa.index)
+                                _dipakai_ea = "persis"
+                                if _ea_blok.strip():
+                                    _m &= (_dfa["BLOCK"].astype(str).str.upper()
+                                           .str.strip() == _ea_blok.upper().strip())
+                                if _ea_rumah.strip():
+                                    _m &= (_dfa["HOUSE_NUMBER"].astype(str).str.strip()
+                                           == _ea_rumah.strip())
+                                for _v, _k in ((_ea_rt, "RT"), (_ea_rw, "RW")):
+                                    if _v.strip():
+                                        _m &= (_dfa[_k].astype(str).str.strip()
+                                               == _v.strip())
+
+                                if not _m.any():
+                                    # Tingkat 2: nol di depan & huruf diabaikan,
+                                    # RT/RW dilepas. Dua vendor sering mengisi
+                                    # '-' di RT/RW, dan nomor rumah ditulis '1'
+                                    # vs '01' -- kedua hal ini terbukti nyata
+                                    # di Cluster Puri Karawaci.
+                                    _dipakai_ea = "ternormalisasi"
+                                    _m = pd.Series(True, index=_dfa.index)
+                                    if _ea_blok.strip():
+                                        _m &= (_dfa["BLOCK"].map(_nm)
+                                               == _nm(_ea_blok))
+                                    if _ea_rumah.strip():
+                                        _m &= (_dfa["HOUSE_NUMBER"].map(_nm)
+                                               == _nm(_ea_rumah))
+
+                                _cocok = _dfa[_m].sort_values("dist_m")
+                                HIDUP = {"ACTIVE", "ASSIGNED", "RESERVED", "AGING"}
+                                _stn = (_cocok["HOMEPASS_STATUS"].astype(str)
+                                        .str.upper().str.strip())
+                                _ass = _cocok[_stn == "ASSIGNED"]
+                                _hid = _cocok[_stn.isin(HIDUP)]
+
+                                if _cocok.empty:
+                                    st.success(
+                                        "**Tidak ada HPID dengan alamat itu di "
+                                        "radius 150 m.** Kandidat sah untuk Add "
+                                        "Homepass baru."
+                                    )
+                                elif not _ass.empty:
+                                    _r = _ass.iloc[0]
+                                    st.error(
+                                        f"⭐ **Sudah ada HPID ASSIGNED di alamat "
+                                        f"ini — tidak perlu Add Homepass.**\n\n"
+                                        f"HPID `{_r['HOMEPASS_ID']}` "
+                                        f"(Blok {_r['BLOCK']} No. {_r['HOUSE_NUMBER']}), "
+                                        f"FAT {_r['FAT_CODE']}, {_r['VENDOR_NAME']}, "
+                                        f"{_r['dist_m']:.0f} m dari titik yang dicek. "
+                                        f"Cukup diaktivasi."
+                                    )
+                                elif not _hid.empty:
+                                    st.warning(
+                                        f"**Ada {len(_hid)} HPID aktif/terpakai di "
+                                        f"alamat itu**, tapi tidak ada yang "
+                                        f"berstatus ASSIGNED. Periksa statusnya di "
+                                        f"tabel di bawah."
+                                    )
+                                else:
+                                    st.success(
+                                        f"**{len(_cocok)} record cocok, tapi "
+                                        f"semuanya tidak tersedia** "
+                                        f"({', '.join(sorted(set(_stn)))}). "
+                                        f"Kandidat sah untuk Add Homepass baru."
+                                    )
+                                    if "EMR" in set(_cocok["VENDOR_NAME"].astype(str)):
+                                        st.caption(
+                                            "97,5% dari 1,2 juta record EMR di HPDB "
+                                            "berstatus NOT_AVAILABLE — vendor lain "
+                                            "hanya 1,5–5,8%. Jadi itu pola "
+                                            "menyeluruh, bukan khusus alamat ini."
+                                        )
+
+                                if not _cocok.empty:
+                                    if _dipakai_ea == "ternormalisasi":
+                                        st.caption(
+                                            "Cocok setelah nol di depan dan huruf "
+                                            "besar/kecil diabaikan serta RT/RW "
+                                            "dilepas — penulisan di form dan di "
+                                            "HPDB berbeda."
+                                        )
+                                    _tc = _cocok[["HOMEPASS_ID", "HOMEPASS_STATUS",
+                                                  "BLOCK", "HOUSE_NUMBER", "RT", "RW",
+                                                  "CLUSTER_NAME", "FAT_CODE",
+                                                  "VENDOR_NAME", "dist_m"]].copy()
+                                    _tc["dist_m"] = _tc["dist_m"].round(1)
+                                    _tc.columns = ["HPID", "Status", "Block",
+                                                   "No. Rumah", "RT", "RW",
+                                                   "Cluster", "FAT", "Vendor",
+                                                   "Jarak (m)"]
+                                    st.dataframe(_tc, width="stretch",
+                                                 hide_index=True,
+                                                 height=min(60 + len(_tc) * 35, 300))
                     else:
                         st.info("Tidak ada HPID dalam radius 150m dari koordinat ini.")
 
