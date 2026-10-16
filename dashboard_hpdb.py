@@ -1575,12 +1575,16 @@ with tab_eligibility:
             ).add_to(fmap)
 
             # Titik HPID existing dalam radius 150m (dot kecil, warna per status)
+            # Diinisialisasi di luar try: dipakai lagi oleh penangkap klik
+            # di bawah peta, dan blok di bawah ini bisa gagal.
+            _df_hp = None
             try:
                 _hc, _ = get_coords_con()
                 if _hc is not None:
                     _deg = 0.0015  # ~150m bbox
                     _df_hp = _hc.execute("""
-                        SELECT HOMEPASS_ID, HOMEPASS_STATUS, blat, blon,
+                        SELECT HOMEPASS_ID, HOMEPASS_STATUS, FAT_CODE,
+                            VENDOR_NAME, blat, blon,
                             6371000 * acos(LEAST(1.0, GREATEST(-1.0,
                                 cos(radians(?)) * cos(radians(blat)) *
                                 cos(radians(blon) - radians(?)) +
@@ -1626,11 +1630,47 @@ with tab_eligibility:
                                       + (f", {_jalan}" if _jalan else "")
                                       + f"<br>{_judul}")
 
+                        # Popup (klik) selain tooltip (hover): isi tooltip
+                        # tidak bisa diseleksi, jadi nomor HPID-nya tidak
+                        # bisa disalin. Popup bisa.
+                        #
+                        # Tombol salin mencoba Clipboard API dulu, lalu
+                        # jatuh ke execCommand. Keduanya bisa diblokir di
+                        # iframe st_folium, karena itu nomornya juga
+                        # ditaruh di elemen terpilih-sendiri (user-select)
+                        # supaya tetap bisa diblok dan Ctrl+C manual --
+                        # dan di bawah peta ada st.code dengan tombol salin
+                        # bawaan Streamlit yang dijamin jalan.
+                        _js = (
+                            "var t=this.dataset.hp;"
+                            "var f=function(){var a=document.createElement('textarea');"
+                            "a.value=t;a.style.position='fixed';a.style.opacity='0';"
+                            "document.body.appendChild(a);a.select();"
+                            "try{document.execCommand('copy')}catch(e){}"
+                            "document.body.removeChild(a)};"
+                            "if(navigator.clipboard&&navigator.clipboard.writeText){"
+                            "navigator.clipboard.writeText(t)['catch'](f)}else{f()}"
+                            "this.textContent='\u2713 Tersalin'"
+                        )
+                        _popup_html = (
+                            "<div style=\"font:13px/1.45 system-ui,sans-serif\">"
+                            f"<div style=\"font:700 15px/1.2 ui-monospace,monospace;"
+                            f"user-select:all;margin-bottom:4px\">{_hid}</div>"
+                            + (f"No. {_nomor}" + (f", {_jalan}" if _jalan else "")
+                               + "<br>" if _nomor else "")
+                            + f"{_st} &middot; {h['dist_m']:.0f} m"
+                            f"<br>FAT {h.get('FAT_CODE', '-')}"
+                            f"<br><button data-hp=\"{_hid}\" onclick=\"{_js}\" "
+                            "style=\"margin-top:6px;padding:4px 10px;cursor:pointer;"
+                            "border:1px solid #888;border-radius:4px;background:#f5f5f5\">"
+                            "\U0001F4CB Salin HPID</button></div>"
+                        )
                         folium.CircleMarker(
                             [float(h["blat"]), float(h["blon"])],
                             radius=4, color=_warna,
                             fill=True, fill_opacity=0.9, weight=1,
                             tooltip=_judul,
+                            popup=folium.Popup(_popup_html, max_width=260),
                         ).add_to(fmap)
 
                         if _nomor and _n_label < BATAS_LABEL:
@@ -1660,7 +1700,45 @@ with tab_eligibility:
 
             folium.LayerControl(collapsed=True, position="topright").add_to(fmap)
 
-            st_folium(fmap, use_container_width=True, height=450, returned_objects=[])
+            # returned_objects diisi supaya klik pada titik HPID dikembalikan
+            # ke Python. Ini memicu rerun, dan itu aman: hasil ORS tersimpan
+            # di st.session_state['_rute_cache'] per koordinat, query DuckDB
+            # dan lookup alamat semuanya @st.cache_data -- jadi rerun tidak
+            # memanggil jaringan maupun memindai ulang parquet.
+            _peta = st_folium(fmap, use_container_width=True, height=450,
+                              returned_objects=["last_object_clicked_popup"])
+
+            _klik = (_peta or {}).get("last_object_clicked_popup") or ""
+            _hp_klik = ""
+            if _klik:
+                # Dicocokkan ke daftar HPID yang memang ada di radius,
+                # bukan mengurai teks popup -- supaya tidak bergantung pada
+                # format tampilan yang bisa berubah.
+                if _df_hp is not None and not _df_hp.empty:
+                    for _cand in _df_hp["HOMEPASS_ID"].astype(str):
+                        if _cand and _cand in _klik:
+                            _hp_klik = _cand
+                            break
+            if _hp_klik:
+                _kc1, _kc2 = st.columns([1, 2])
+                with _kc1:
+                    st.caption("HPID yang diklik — tombol salin di pojok kanan")
+                    st.code(_hp_klik, language=None)
+                with _kc2:
+                    _dd = _df_hp[
+                        _df_hp["HOMEPASS_ID"].astype(str) == _hp_klik]
+                    if not _dd.empty:
+                        _d0 = _dd.iloc[0]
+                        _al1 = alamat_hpid((_hp_klik,)).get(_hp_klik, ("", ""))
+                        st.caption("Detail")
+                        st.markdown(
+                            f"**{_d0['HOMEPASS_STATUS']}** &middot; "
+                            f"{_d0['dist_m']:.0f} m dari titik yang dicek"
+                            + (f"<br>No. {_al1[0]}" if _al1[0] else "")
+                            + (f", {_al1[1]}" if _al1[1] else "")
+                            + f"<br>FAT {_d0.get('FAT_CODE', '-')} &middot; "
+                              f"{_d0.get('VENDOR_NAME', '-')}",
+                            unsafe_allow_html=True)
 
             # ── STREET VIEW ────────────────────────────────────────────────
             # Dua jalur, dipilih otomatis:
