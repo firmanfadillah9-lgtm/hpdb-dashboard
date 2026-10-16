@@ -1641,21 +1641,33 @@ with tab_eligibility:
                         # supaya tetap bisa diblok dan Ctrl+C manual --
                         # dan di bawah peta ada st.code dengan tombol salin
                         # bawaan Streamlit yang dijamin jalan.
+                        # Tombol hanya mengaku berhasil kalau MEMANG berhasil.
+                        # Peta dirender di dalam iframe st_folium, dan akses
+                        # klipboard dari iframe bisa ditolak browser. Kalau
+                        # kedua cara gagal, tombol menyuruh pengguna menyalin
+                        # manual -- bukan menulis "Tersalin" padahal tidak.
                         _js = (
-                            "var t=this.dataset.hp;"
+                            "var b=this,t=b.dataset.hp;"
+                            "var ok=function(){b.textContent='\u2713 Tersalin';"
+                            "b.style.background='#d4f8d4'};"
+                            "var gagal=function(){b.textContent="
+                            "'\u26A0 Blok nomornya, lalu Ctrl+C';"
+                            "b.style.background='#ffe9c7'};"
                             "var f=function(){var a=document.createElement('textarea');"
                             "a.value=t;a.style.position='fixed';a.style.opacity='0';"
                             "document.body.appendChild(a);a.select();"
-                            "try{document.execCommand('copy')}catch(e){}"
-                            "document.body.removeChild(a)};"
+                            "var s=false;try{s=document.execCommand('copy')}catch(e){}"
+                            "document.body.removeChild(a);s?ok():gagal()};"
                             "if(navigator.clipboard&&navigator.clipboard.writeText){"
-                            "navigator.clipboard.writeText(t)['catch'](f)}else{f()}"
-                            "this.textContent='\u2713 Tersalin'"
+                            "navigator.clipboard.writeText(t).then(ok,f)}else{f()}"
                         )
                         _popup_html = (
                             "<div style=\"font:13px/1.45 system-ui,sans-serif\">"
                             f"<div style=\"font:700 15px/1.2 ui-monospace,monospace;"
-                            f"user-select:all;margin-bottom:4px\">{_hid}</div>"
+                            f"user-select:all;margin-bottom:2px;cursor:text\" "
+                            f"title=\"Klik sekali untuk memblok seluruh nomor\">{_hid}</div>"
+                            "<div style=\"font-size:11px;color:#777;margin-bottom:4px\">"
+                            "klik nomor di atas untuk memblok</div>"
                             + (f"No. {_nomor}" + (f", {_jalan}" if _jalan else "")
                                + "<br>" if _nomor else "")
                             + f"{_st} &middot; {h['dist_m']:.0f} m"
@@ -1700,45 +1712,21 @@ with tab_eligibility:
 
             folium.LayerControl(collapsed=True, position="topright").add_to(fmap)
 
-            # returned_objects diisi supaya klik pada titik HPID dikembalikan
-            # ke Python. Ini memicu rerun, dan itu aman: hasil ORS tersimpan
-            # di st.session_state['_rute_cache'] per koordinat, query DuckDB
-            # dan lookup alamat semuanya @st.cache_data -- jadi rerun tidak
-            # memanggil jaringan maupun memindai ulang parquet.
-            _peta = st_folium(fmap, use_container_width=True, height=450,
-                              returned_objects=["last_object_clicked_popup"])
-
-            _klik = (_peta or {}).get("last_object_clicked_popup") or ""
-            _hp_klik = ""
-            if _klik:
-                # Dicocokkan ke daftar HPID yang memang ada di radius,
-                # bukan mengurai teks popup -- supaya tidak bergantung pada
-                # format tampilan yang bisa berubah.
-                if _df_hp is not None and not _df_hp.empty:
-                    for _cand in _df_hp["HOMEPASS_ID"].astype(str):
-                        if _cand and _cand in _klik:
-                            _hp_klik = _cand
-                            break
-            if _hp_klik:
-                _kc1, _kc2 = st.columns([1, 2])
-                with _kc1:
-                    st.caption("HPID yang diklik — tombol salin di pojok kanan")
-                    st.code(_hp_klik, language=None)
-                with _kc2:
-                    _dd = _df_hp[
-                        _df_hp["HOMEPASS_ID"].astype(str) == _hp_klik]
-                    if not _dd.empty:
-                        _d0 = _dd.iloc[0]
-                        _al1 = alamat_hpid((_hp_klik,)).get(_hp_klik, ("", ""))
-                        st.caption("Detail")
-                        st.markdown(
-                            f"**{_d0['HOMEPASS_STATUS']}** &middot; "
-                            f"{_d0['dist_m']:.0f} m dari titik yang dicek"
-                            + (f"<br>No. {_al1[0]}" if _al1[0] else "")
-                            + (f", {_al1[1]}" if _al1[1] else "")
-                            + f"<br>FAT {_d0.get('FAT_CODE', '-')} &middot; "
-                              f"{_d0.get('VENDOR_NAME', '-')}",
-                            unsafe_allow_html=True)
+            # returned_objects SENGAJA kosong.
+            #
+            # Pernah dicoba diisi ["last_object_clicked_popup"] supaya klik
+            # bisa ditangkap Python dan HPID-nya ditaruh di st.code (yang
+            # punya tombol salin bawaan). Hasilnya regresi: tiap klik memicu
+            # rerun, st_folium membangun ulang peta dari zoom_start, dan
+            # posisi serta zoom pengguna hilang -- jadi harus zoom ulang
+            # setiap kali mengklik satu titik.
+            #
+            # st_folium tidak punya cara mempertahankan view tanpa ikut
+            # mengembalikan center/zoom, dan itu malah memicu rerun di
+            # SETIAP geser dan zoom. Jadi penyalinan dikerjakan sepenuhnya
+            # di dalam popup (tombol salin + user-select:all), tanpa rerun.
+            st_folium(fmap, use_container_width=True, height=450,
+                      returned_objects=[])
 
             # ── STREET VIEW ────────────────────────────────────────────────
             # Dua jalur, dipilih otomatis:
