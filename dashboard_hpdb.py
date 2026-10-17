@@ -23,6 +23,7 @@ import duckdb
 import requests
 import os
 import hashlib
+import html
 import io
 
 
@@ -584,6 +585,19 @@ def df_alamat_hpid(ids_tuple):
         """).df()
     except Exception:
         return pd.DataFrame()
+
+
+def aman_html(x) -> str:
+    """Teks data -> aman disisipkan ke tooltip/popup folium.
+
+    Folium menaruh tooltip di template literal JavaScript (`...`) TANPA
+    meng-escape backtick. Satu nomor rumah seperti "THE GLEN`S COFFE"
+    (PTK1-SNG02-H06773, Pontianak) memutus seluruh skrip peta: SyntaxError,
+    dan peta tampil kosong tanpa pesan error. Jadi semua teks dari data
+    di-escape dulu: HTML biasa + backtick, backslash, dan "${".
+    """
+    s = html.escape(str(x if x is not None else ""), quote=True)
+    return s.replace("`", "&#96;").replace("\\", "&#92;").replace("${", "&#36;{")
 
 
 def alamat_hpid(ids_tuple):
@@ -1502,13 +1516,13 @@ with tab_eligibility:
                         is_elig = r["distance_m"] <= RADIUS_M
                     folium.Marker(
                         [r["lat"], r["lon"]],
-                        tooltip=f"{r['FAT_CODE']} — udara {r['distance_m']:.0f}m | {rd_txt}",
+                        tooltip=f"{aman_html(r['FAT_CODE'])} — udara {r['distance_m']:.0f}m | {rd_txt}",
                         popup=folium.Popup(
-                            f"<b>{r['FAT_CODE']}</b><br>"
+                            f"<b>{aman_html(r['FAT_CODE'])}</b><br>"
                             f"Jarak udara: {r['distance_m']:.0f}m<br>"
                             f"Jarak jalan: {rd_txt}<br>"
-                            f"Cluster: {r.get('CLUSTER_NAME','')}<br>"
-                            f"City: {r.get('CITY','')}",
+                            f"Cluster: {aman_html(r.get('CLUSTER_NAME',''))}<br>"
+                            f"City: {aman_html(r.get('CITY',''))}",
                             max_width=260,
                         ),
                         icon=folium.Icon(
@@ -1520,7 +1534,7 @@ with tab_eligibility:
                     # Label kode FAT di sebelah marker, seperti tampilan
                     # Google Earth tim planning. Ikut FeatureGroup label
                     # supaya bisa dimatikan bersama nomor rumah.
-                    _fat_lbl = str(r["FAT_CODE"])
+                    _fat_lbl = aman_html(r["FAT_CODE"])
                     folium.Marker(
                         [r["lat"], r["lon"]],
                         icon=folium.DivIcon(
@@ -1622,6 +1636,8 @@ with tab_eligibility:
                         _st = str(h["HOMEPASS_STATUS"]).upper()
                         _hid = str(h["HOMEPASS_ID"])
                         _nomor, _jalan = _alamat.get(_hid, ("", ""))
+                        _nomor, _jalan = aman_html(_nomor), aman_html(_jalan)
+                        _hid = aman_html(_hid)
                         _warna = _status_color.get(_st, "#7f8c8d")
 
                         _judul = f"{_hid} — {_st} ({h['dist_m']:.0f}m)"
@@ -1671,7 +1687,7 @@ with tab_eligibility:
                             + (f"No. {_nomor}" + (f", {_jalan}" if _jalan else "")
                                + "<br>" if _nomor else "")
                             + f"{_st} &middot; {h['dist_m']:.0f} m"
-                            f"<br>FAT {h.get('FAT_CODE', '-')}"
+                            f"<br>FAT {aman_html(h.get('FAT_CODE', '-'))}"
                             f"<br><button data-hp=\"{_hid}\" onclick=\"{_js}\" "
                             "style=\"margin-top:6px;padding:4px 10px;cursor:pointer;"
                             "border:1px solid #888;border-radius:4px;background:#f5f5f5\">"
