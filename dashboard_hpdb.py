@@ -135,6 +135,11 @@ def _rute_sisa() -> float:
     return max(0.0, st.session_state.get("_rute_batas", 0.0) - time.monotonic())
 
 
+def _rute_galat(pesan: str) -> None:
+    """Catat alasan gagal terakhir hitung jarak jalan (ditampilkan di peringatan)."""
+    st.session_state["_rute_galat"] = pesan
+
+
 def _rute_cache() -> dict:
     return st.session_state.setdefault("_rute_cache", {})
 
@@ -214,9 +219,11 @@ def ors_rute(lat1, lon1, lat2, lon2):
 
     key = _ors_key()
     if not key:
+        _rute_galat("API key ORS belum diisi di Secrets")
         return None, None
     sisa = _rute_sisa()
     if sisa < 0.5:
+        _rute_galat(f"batas waktu {ANGGARAN_RUTE_S:.0f} detik habis")
         return None, None
 
     try:
@@ -227,11 +234,22 @@ def ors_rute(lat1, lon1, lat2, lon2):
             timeout=min(PER_CALL_S, sisa),
         )
         if resp.status_code != 200:
+            # Simpan alasan asli dari ORS supaya peringatan di layar tidak menebak-nebak
+            try:
+                pesan = resp.json().get("error", {})
+                pesan = pesan.get("message", "") if isinstance(pesan, dict) else str(pesan)
+            except Exception:
+                pesan = resp.text[:120]
+            _rute_galat(f"ORS HTTP {resp.status_code}: {pesan}".strip(": "))
             return None, None
         feat = resp.json()["features"][0]
         jarak = feat["properties"]["summary"]["distance"]
         titik = [[x[1], x[0]] for x in feat["geometry"]["coordinates"]]
-    except Exception:
+    except requests.Timeout:
+        _rute_galat(f"server ORS tidak menjawab dalam {PER_CALL_S:.0f} detik")
+        return None, None
+    except Exception as e:
+        _rute_galat(f"{type(e).__name__}: {str(e)[:100]}")
         return None, None
 
     c[kunci] = (jarak, titik)
@@ -1419,6 +1437,7 @@ with tab_eligibility:
             if top_n > 0:
                 # Seluruh panggilan OSRM di script run ini dibatasi 8 detik.
                 rute_mulai_anggaran()
+                st.session_state.pop("_rute_galat", None)
                 with st.spinner(f"Menghitung jarak jalan untuk {top_n} FAT terdekat..."):
                     for idx in range(top_n):
                         row = nearby.iloc[idx]
@@ -1430,11 +1449,19 @@ with tab_eligibility:
                     if isinstance(v, dict) and v.get("road_distance_m") is not None
                 )
                 if _berhasil == 0:
-                    st.warning(
-                        "Jarak jalan tidak tersedia — angka di bawah memakai jarak udara. "
-                        "Pastikan API key OpenRouteService sudah diisi di Secrets:  "
-                        "[ors] key = \"...\""
-                    )
+                    _galat = st.session_state.get("_rute_galat", "") or "alasan tidak diketahui"
+                    _saran = ""
+                    if "belum diisi" in _galat:
+                        _saran = ' Isi di Secrets: [ors] key = "...".'
+                    elif "HTTP 403" in _galat or "HTTP 429" in _galat:
+                        _saran = (" Kuota ORS (2.000 permintaan/hari, 40/menit) kemungkinan habis — "
+                                  "coba lagi nanti.")
+                    elif "HTTP 404" in _galat:
+                        _saran = " Titik rumah/FAT terlalu jauh dari jalan yang terpetakan."
+                    elif "detik" in _galat:
+                        _saran = " Server ORS sedang lambat — matikan lalu centang lagi untuk mencoba ulang."
+                    st.warning(f"Jarak jalan tidak tersedia ({_galat}) — angka di bawah memakai "
+                               f"jarak udara.{_saran}")
 
             # ─── PETA (Folium — satelit + marker interaktif) ─────────────────
             import folium
