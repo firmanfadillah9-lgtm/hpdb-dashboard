@@ -53,6 +53,10 @@ ORS_BASE = "https://api.openrouteservice.org"
 # terikat arah jalan satu arah. "driving-car" memaksa rute memutar blok (gang perumahan
 # tidak dianggap jalan mobil, jalan satu arah dipatuhi) -> FAT 25 m udara bisa terukur 215 m.
 ORS_PROFILE = "foot-walking"
+# Snap = jarak titik ke jalan terpetakan terdekat di OpenStreetMap. Kalau lebih jauh dari ini,
+# jalan di sekitar rumah/FAT belum terpetakan: rute "rumah -> jalan jauh -> FAT" tidak mewakili
+# tarikan kabel (kasus FBK007S10E02: udara 25 m, terukur 117 + 2 + 96 = 216 m) -> pakai jarak udara.
+SNAP_MAKS_M = 50
 PROFIL_RUTE = {
     "foot-walking": "Jalan kaki — lewat gang, abaikan jalan satu arah (disarankan)",
     "driving-car": "Mobil — ikut jalan mobil & arah satu arah",
@@ -280,6 +284,13 @@ def calc_road_distance(cust_lat, cust_lon, fat_lat, fat_lon, profile=None):
 
     snap_c = _haversine_m(cust_lat, cust_lon, titik[0][0], titik[0][1]) if titik else 0.0
     snap_f = _haversine_m(fat_lat, fat_lon, titik[-1][0], titik[-1][1]) if titik else 0.0
+    if max(snap_c, snap_f) > SNAP_MAKS_M:
+        _rute_galat(f"jalan di sekitar titik belum terpetakan di OpenStreetMap "
+                    f"(rumah→jalan {snap_c:.0f} m, jalan→FAT {snap_f:.0f} m)")
+        return {"road_distance_m": None, "success": False, "tak_terpetakan": True,
+                "detail": (f"jalan belum terpetakan (rumah→jalan {snap_c:.0f} m, jalan→FAT {snap_f:.0f} m) "
+                           "→ pakai jarak udara"),
+                "route_pts": None}
     total = snap_c + jarak + snap_f
     return {
         "road_distance_m": round(total, 1),
@@ -1860,13 +1871,16 @@ with tab_eligibility:
                     comp_rows.append({
                         "FAT_Code": row["FAT_CODE"],
                         "Air_Distance_m": row["distance_m"],
-                        "Road_Distance_m": road_d if road_d is not None else "Gagal",
+                        "Road_Distance_m": (road_d if road_d is not None else
+                                            "tak terpetakan" if rr.get("tak_terpetakan") else "Gagal"),
                         "Selisih_m": round(road_d - row["distance_m"], 1) if road_d is not None else "-",
                         "Rincian": (str(rr.get("detail", "")).replace("snap_customer=", "rumah→jalan ")
                                     .replace(" + route=", " + rute ").replace(" + snap_fat=", " + jalan→FAT ")
                                     if road_d is not None else str(rr.get("detail", ""))),
                         "Eligible_Air_150m": "✅" if row["distance_m"] <= RADIUS_M else "❌",
-                        "Eligible_Road_150m": ("✅" if road_d <= RADIUS_M else "❌") if road_d is not None else "?",
+                        "Eligible_Road_150m": (("✅" if road_d <= RADIUS_M else "❌") if road_d is not None else
+                                               (("✅" if row["distance_m"] <= RADIUS_M else "❌") + " (udara)")
+                                               if rr.get("tak_terpetakan") else "?"),
                     })
                 df_comp = pd.DataFrame(comp_rows)
                 st.dataframe(df_comp, width="stretch", hide_index=True)
@@ -1887,16 +1901,22 @@ with tab_eligibility:
 
             # ─── HASIL ELIGIBILITAS (berbasis ROAD DISTANCE) ────────────────
             # Tentukan within_radius_road: FAT yang road distance-nya <= 150m
+            # FAT tanpa jarak jalan yang andal (tidak dicentang, ORS gagal, atau jalan belum
+            # terpetakan) memakai jarak udara, ditandai sumber="udara".
             within_radius_road = []
-            for idx in range(top_n):
+            _ada_udara = False
+            for idx in range(top_n if top_n > 0 else len(nearby)):
                 row = nearby.iloc[idx]
                 rr = road_results.get(row["FAT_CODE"], {})
-                road_d = rr.get("road_distance_m")
-                if road_d is not None and road_d <= RADIUS_M:
-                    within_radius_road.append({**row.to_dict(), "road_distance_m": road_d})
+                road_d, sumber = rr.get("road_distance_m"), "jalan"
+                if road_d is None:
+                    road_d, sumber = float(row["distance_m"]), "udara"
+                if road_d <= RADIUS_M:
+                    within_radius_road.append({**row.to_dict(), "road_distance_m": road_d, "sumber": sumber})
+                    _ada_udara = _ada_udara or sumber == "udara"
 
             if not within_radius_road:
-                st.error(f"❌ **TIDAK ELIGIBLE** — tidak ada FAT dengan jarak jalan ≤ {RADIUS_M}m.")
+                st.error(f"❌ **TIDAK ELIGIBLE** — tidak ada FAT dalam jarak ≤ {RADIUS_M}m.")
                 if top_n > 0:
                     nearest = nearby.iloc[0]
                     nearest_road = road_results.get(nearest["FAT_CODE"], {}).get("road_distance_m")
@@ -1910,13 +1930,16 @@ with tab_eligibility:
             else:
                 st.success(
                     f"✅ **ELIGIBLE** — ditemukan {len(within_radius_road)} FAT "
-                    f"dengan jarak jalan ≤ {RADIUS_M}m."
+                    f"dengan jarak ≤ {RADIUS_M}m."
                 )
+                if _ada_udara:
+                    st.caption("⚠️ Sebagian jarak memakai garis lurus (jarak jalan tidak dihitung atau jalan di "
+                               "sekitar titik belum terpetakan) — pastikan jalur tarikan lewat foto/KMZ.")
 
                 if len(within_radius_road) > 1:
                     st.caption("Beberapa FAT eligible, pilih salah satu untuk lihat detail:")
                     option_labels = [
-                        f"{r['FAT_CODE']} — jalan: {r['road_distance_m']:.0f}m (udara: {r['distance_m']:.0f}m) | "
+                        f"{r['FAT_CODE']} — {r['sumber']}: {r['road_distance_m']:.0f}m (udara: {r['distance_m']:.0f}m) | "
                         f"{r['CLUSTER_NAME']}, {r['CITY']} ({r['REGION']})"
                         for r in within_radius_road
                     ]
@@ -1929,7 +1952,7 @@ with tab_eligibility:
                     elig_idx = 0
                     nearest = within_radius_road[0]
                     st.write(
-                        f"**{nearest['FAT_CODE']}** — jarak jalan **{nearest['road_distance_m']:.0f}m** "
+                        f"**{nearest['FAT_CODE']}** — jarak {nearest['sumber']} **{nearest['road_distance_m']:.0f}m** "
                         f"(udara: {nearest['distance_m']:.0f}m) | "
                         f"{nearest['CLUSTER_NAME']}, {nearest['CITY']} ({nearest['REGION']})"
                     )
