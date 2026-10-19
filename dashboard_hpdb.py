@@ -49,7 +49,14 @@ import io
 # mematikan fitur ini. Anggaran waktu tetap berlaku sebagai pengaman.
 # ---------------------------------------------------------------------------
 ORS_BASE = "https://api.openrouteservice.org"
-ORS_PROFILE = "driving-car"
+# Profil default "foot-walking": kabel ditarik lewat tiang di gang/jalan setapak dan tidak
+# terikat arah jalan satu arah. "driving-car" memaksa rute memutar blok (gang perumahan
+# tidak dianggap jalan mobil, jalan satu arah dipatuhi) -> FAT 25 m udara bisa terukur 215 m.
+ORS_PROFILE = "foot-walking"
+PROFIL_RUTE = {
+    "foot-walking": "Jalan kaki — lewat gang, abaikan jalan satu arah (disarankan)",
+    "driving-car": "Mobil — ikut jalan mobil & arah satu arah",
+}
 ANGGARAN_RUTE_S = 10.0     # total semua permintaan dalam satu script run
 PER_CALL_S = 4.0           # batas tiap permintaan
 
@@ -210,9 +217,10 @@ def esri_zoom_terdalam(lat_bulat, lon_bulat, base=ESRI_IMAGERY):
 
 
 
-def ors_rute(lat1, lon1, lat2, lon2):
+def ors_rute(lat1, lon1, lat2, lon2, profile=None):
     """Satu permintaan ORS -> (jarak_rute_m, titik_rute). (None, None) kalau gagal."""
-    kunci = (round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
+    profile = profile or st.session_state.get("rute_profil") or ORS_PROFILE
+    kunci = (profile, round(lat1, 6), round(lon1, 6), round(lat2, 6), round(lon2, 6))
     c = _rute_cache()
     if kunci in c:
         return c[kunci]
@@ -228,7 +236,7 @@ def ors_rute(lat1, lon1, lat2, lon2):
 
     try:
         resp = requests.post(
-            f"{ORS_BASE}/v2/directions/{ORS_PROFILE}/geojson",
+            f"{ORS_BASE}/v2/directions/{profile}/geojson",
             json={"coordinates": [[lon1, lat1], [lon2, lat2]]},
             headers={"Authorization": key, "Content-Type": "application/json"},
             timeout=min(PER_CALL_S, sisa),
@@ -262,7 +270,7 @@ def calc_road_distance(cust_lat, cust_lon, fat_lat, fat_lon, profile=None):
     road_distance = snap(customer) + route + snap(FAT)
     Return dict: {road_distance_m, success, detail, route_pts}
     """
-    jarak, titik = ors_rute(cust_lat, cust_lon, fat_lat, fat_lon)
+    jarak, titik = ors_rute(cust_lat, cust_lon, fat_lat, fat_lon, profile)
     if jarak is None:
         alasan = ("API key ORS belum diisi di Secrets"
                   if not _ors_key() else
@@ -1432,6 +1440,9 @@ with tab_eligibility:
                 "Hitung jarak jalan (OpenRouteService) — lebih akurat, perlu beberapa detik",
                 value=False, key="pakai_osrm",
             )
+            if pakai_osrm:
+                st.radio("Profil rute", list(PROFIL_RUTE), format_func=PROFIL_RUTE.get,
+                         horizontal=True, key="rute_profil")
             top_n = min(3, len(nearby)) if pakai_osrm else 0
             road_results = {}
             if top_n > 0:
@@ -1835,9 +1846,11 @@ with tab_eligibility:
             # ─── TABEL PERBANDINGAN AIR vs ROAD DISTANCE ────────────────────
             if road_results:
                 st.markdown("##### 🛣️ Jarak Jalan (Road Distance) vs Jarak Lurus (Air Distance)")
+                _prof = st.session_state.get("rute_profil") or ORS_PROFILE
                 st.caption(
-                    "Road distance dihitung mengikuti jalan sebenarnya (via OpenRouteService), "
-                    "lebih akurat untuk estimasi tarikan kabel dibanding jarak garis lurus."
+                    f"Road distance = jarak rumah ke jalan + rute + jarak jalan ke FAT, via OpenRouteService "
+                    f"profil **{PROFIL_RUTE.get(_prof, _prof).split(' — ')[0]}**. Kalau 'Rumah→jalan' besar, "
+                    "gang di sekitar rumah belum terpetakan di OpenStreetMap sehingga rute memutar."
                 )
                 comp_rows = []
                 for idx in range(top_n):
@@ -1849,6 +1862,9 @@ with tab_eligibility:
                         "Air_Distance_m": row["distance_m"],
                         "Road_Distance_m": road_d if road_d is not None else "Gagal",
                         "Selisih_m": round(road_d - row["distance_m"], 1) if road_d is not None else "-",
+                        "Rincian": (str(rr.get("detail", "")).replace("snap_customer=", "rumah→jalan ")
+                                    .replace(" + route=", " + rute ").replace(" + snap_fat=", " + jalan→FAT ")
+                                    if road_d is not None else str(rr.get("detail", ""))),
                         "Eligible_Air_150m": "✅" if row["distance_m"] <= RADIUS_M else "❌",
                         "Eligible_Road_150m": ("✅" if road_d <= RADIUS_M else "❌") if road_d is not None else "?",
                     })
