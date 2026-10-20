@@ -346,7 +346,9 @@ def check_login():
         submitted = st.form_submit_button("Login")
 
     if submitted:
-        user = users.get(username)
+        # username tidak peka huruf besar/kecil & spasi (keyboard HP sering kapital otomatis)
+        username = username.strip().lower()
+        user = {str(k).lower(): v for k, v in users.items()}.get(username)
         if user and hash_password(password) == user.get("password_hash"):
             st.session_state["authenticated"] = True
             st.session_state["user_role"] = user.get("role", "viewer")
