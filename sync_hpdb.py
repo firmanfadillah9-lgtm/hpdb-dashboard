@@ -164,7 +164,10 @@ def main():
             print(f"        - {os.path.basename(f)} ({os.path.getsize(f)/1024/1024:.0f} MB)")
 
         con = duckdb.connect(DB_PATH)
-        con.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+        # Isi ke tabel staging dulu; tabel lama baru diganti setelah SEMUA file terbaca
+        # (dulu DROP di awal -> kalau baca .xlsb gagal, tabel hpdb hilang & match_hpid error).
+        tabel_baru = f"{TABLE_NAME}_baru"
+        con.execute(f"DROP TABLE IF EXISTS {tabel_baru}")
 
         tabel_dibuat = False
         total_baris = 0
@@ -181,10 +184,10 @@ def main():
 
                 con.register("df_batch", df)
                 if not tabel_dibuat:
-                    con.execute(f"CREATE TABLE {TABLE_NAME} AS SELECT * FROM df_batch")
+                    con.execute(f"CREATE TABLE {tabel_baru} AS SELECT * FROM df_batch")
                     tabel_dibuat = True
                 else:
-                    con.execute(f"INSERT INTO {TABLE_NAME} SELECT * FROM df_batch")
+                    con.execute(f"INSERT INTO {tabel_baru} SELECT * FROM df_batch")
                 con.unregister("df_batch")
 
                 total_baris += len(df)
@@ -194,6 +197,12 @@ def main():
 
         if not tabel_dibuat:
             raise ValueError("Tidak ada data yang berhasil dibaca.")
+
+        # Ganti tabel lama dengan yang baru dalam satu transaksi
+        con.execute("BEGIN TRANSACTION")
+        con.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+        con.execute(f"ALTER TABLE {tabel_baru} RENAME TO {TABLE_NAME}")
+        con.execute("COMMIT")
 
         # Index untuk mempercepat lookup
         print("\n[INFO] Membuat index...")

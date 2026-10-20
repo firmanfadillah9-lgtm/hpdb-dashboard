@@ -16,8 +16,13 @@ Langkah:
   6. push_status.py        unggah status_history.parquet
   7. push_coords_bulk.py   unggah hpdb_coords_bulk.parquet
 
+Langkah 0 (siapkan_hpdb.py): pilih folder KEMARIN di OneDrive & pastikan .xlsb sudah terunduh,
+lalu folder itu diberikan ke sync_hpdb.py --folder.
+
 Cara pakai:
-    python update_hpdb.py                 # semua langkah
+    python update_hpdb.py                 # semua langkah, folder kemarin
+    python update_hpdb.py --tanggal 20261019
+    python update_hpdb.py --terbaru       # folder paling baru (perilaku lama)
     python update_hpdb.py --tanpa-upload  # sampai langkah 4 saja (offline)
     python update_hpdb.py --lanjut        # lewati sync, mulai dari langkah 2
 """
@@ -61,6 +66,24 @@ def jalankan(skrip, args, judul, n, total):
     return False
 
 
+def siapkan_folder():
+    """Langkah 0: siapkan_hpdb.py -> path folder HPDB yang file-nya sudah terunduh (None kalau gagal)."""
+    print(f"\n{'='*70}\n  [0] Pilih folder HPDB & unduh dari OneDrive\n{'='*70}")
+    teruskan = [a for i, a in enumerate(sys.argv[1:], 1)
+                if a in ("--terbaru", "--tanggal") or (i > 1 and sys.argv[i - 1] == "--tanggal")]
+    r = subprocess.run([PY, "siapkan_hpdb.py", *teruskan], cwd=HERE, env=ENV,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    folder = None
+    for baris in (r.stdout or "").splitlines():
+        if baris.startswith("FOLDER_SIAP: "):
+            folder = baris[len("FOLDER_SIAP: "):].strip()
+        else:
+            print("  " + baris)
+    if r.stderr:
+        print(r.stderr[-800:])
+    return folder if r.returncode == 0 else None
+
+
 def main():
     tanpa_upload = "--tanpa-upload" in sys.argv
     lanjut = "--lanjut" in sys.argv
@@ -68,6 +91,13 @@ def main():
     tugas = [x for x in LANGKAH
              if not (lanjut and x[3] == "sync")
              and not (tanpa_upload and x[3] == "upload")]
+    if not lanjut:
+        folder = siapkan_folder()
+        if not folder:
+            print("\n  [GAGAL] Folder HPDB belum siap - update dihentikan.")
+            return 1
+        tugas = [(sk, (["--folder", folder] if sk == "sync_hpdb.py" else ar), jd, kt)
+                 for sk, ar, jd, kt in tugas]
 
     mulai = time.time()
     print("=" * 70)
@@ -98,7 +128,9 @@ def main():
         print("  menarik parquet baru (cache lama akan dihapus).")
     else:
         print("\n  Ada langkah yang gagal — periksa pesan di atas.")
+        return 1                     # kode keluar != 0 supaya bot / Task Scheduler tahu gagal
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
