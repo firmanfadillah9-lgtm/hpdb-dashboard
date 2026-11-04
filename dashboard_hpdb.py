@@ -1514,7 +1514,7 @@ with tab_eligibility:
 
                 # ─── PETA (Folium — satelit + marker interaktif) ─────────────────
                 import folium
-                from streamlit_folium import st_folium
+                import streamlit.components.v1 as _components
 
                 fmap = folium.Map(
                     location=[input_lat, input_lon], zoom_start=18, max_zoom=21, tiles=None,
@@ -1817,8 +1817,12 @@ with tab_eligibility:
                 # mengembalikan center/zoom, dan itu malah memicu rerun di
                 # SETIAP geser dan zoom. Jadi penyalinan dikerjakan sepenuhnya
                 # di dalam popup (tombol salin + user-select:all), tanpa rerun.
-                st_folium(fmap, use_container_width=True, height=450,
-                          returned_objects=[])
+                #
+                # 4 Nov: di Streamlit Cloud komponen st_folium sering gagal dimuat ("Your app is having trouble
+                # loading the streamlit_folium.st_folium component"). Karena memang tidak ada data yang dikirim
+                # balik ke Python, peta dirender sebagai HTML statis -- isi & interaksi peta (zoom, layer, popup,
+                # tombol salin) sama, tanpa aset komponen yang bisa gagal dimuat.
+                _components.html(fmap.get_root().render(), height=450)
 
                 # ── STREET VIEW ────────────────────────────────────────────────
                 # Dua jalur, dipilih otomatis:
