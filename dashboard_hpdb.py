@@ -25,6 +25,7 @@ import os
 import hashlib
 import html
 import io
+import re
 
 
 
@@ -761,9 +762,59 @@ if sel_vendor:
 where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
 
+# ─── HELPER: CEK NOMOR RUMAH DI SATU FAT ────────────────────────────────────
+def _norm_nomor(teks):
+    """'No. 012-B' -> '12B', 'Blok B1 / 38' -> 'B138' (huruf besar, tanpa kata NO/NOMOR/BLOK, tanpa nol di depan
+    angka, tanpa tanda baca). Nomor dummy '?-89' -> '' (bukan nomor rumah asli)."""
+    t = str(teks or "").strip().upper()
+    if not t or t.startswith("?"):
+        return ""
+    t = re.sub(r"\b(NOMOR|NO|BLOK|BLOCK|BLK)\b\.?", " ", t)
+    t = re.sub(r"[^A-Z0-9]", "", t)
+    return re.sub(r"(^|[^0-9])0+(?=[0-9])", r"\1", t)
+
+
+def _cek_nomor_rumah(df, fat_code, ns="fat"):
+    """Kolom isian: apakah nomor rumah (opsional dengan blok) sudah ada HPID-nya di FAT ini."""
+    q = st.text_input("🔎 Cek nomor rumah di FAT ini", key=f"{ns}_cek_no_{fat_code}",
+                      placeholder="mis. 12B · B1/38 · Blok C3 No 7",
+                      help="Dicocokkan dengan No. Rumah dan Blok + No. Rumah semua HPID di FAT ini "
+                           "(huruf besar/kecil, spasi, titik, 'No', 'Blok' dan nol di depan diabaikan). "
+                           "Nomor dummy berawalan ?- tidak dihitung.")
+    kunci = _norm_nomor(q)
+    if not kunci:
+        return
+    no = df["HOUSE_NUMBER"].map(_norm_nomor)
+    blok_no = df["BLOCK"].map(_norm_nomor) + no
+    persis = df[(no != "") & ((no == kunci) | (blok_no == kunci))]
+    angka = re.match(r"\D*(\d+)", kunci)
+    mirip = df.iloc[0:0]
+    if persis.empty and angka:
+        induk = no.str.extract(r"^\D*(\d+)", expand=False)
+        mirip = df[(no != "") & (induk == angka.group(1))]
+
+    def _baris(r):
+        alamat = " ".join(x for x in (r["STREET_NAME"], f"blok {r['BLOCK']}" if r["BLOCK"] else "",
+                                      f"no.{r['HOUSE_NUMBER']}") if x)
+        return f"`{r['HOMEPASS_ID']}` {r['HOMEPASS_STATUS']} — {alamat}"
+
+    if not persis.empty:
+        st.warning(f"**Nomor {q.strip()} sudah ada** di FAT `{fat_code}` ({len(persis)} HPID):\n\n"
+                   + "\n".join(f"- {_baris(r)}" for _, r in persis.head(10).iterrows())
+                   + ("\n\nCek nama jalan/blok — FAT bisa melayani lebih dari satu jalan." if
+                      persis["STREET_NAME"].nunique() > 1 or df["STREET_NAME"].nunique() > 1 else ""))
+    elif not mirip.empty:
+        st.info(f"Nomor **{q.strip()}** belum ada persis di FAT ini. Nomor serupa ({len(mirip)}):\n\n"
+                + "\n".join(f"- {_baris(r)}" for _, r in mirip.head(10).iterrows()))
+    else:
+        st.success(f"Nomor **{q.strip()}** belum ada di FAT `{fat_code}` "
+                   f"({int((no != '').sum())} HPID bernomor; nomor dummy `?-` tidak dihitung).")
+
+
 # ─── HELPER: RENDER DETAIL FAT (dipakai di FAT Explorer & Cek Eligibilitas) ──
-def render_fat_detail(con, fat_code):
-    """Render detail FAT, utilisasi port, dan daftar homepass untuk fat_code tertentu."""
+def render_fat_detail(con, fat_code, ns="fat"):
+    """Render detail FAT, utilisasi port, dan daftar homepass untuk fat_code tertentu.
+    ns: awalan key widget (FAT Explorer & Cek Eligibilitas memakai fungsi ini)."""
     detail = con.execute("""
         SELECT FAT_CODE, FDT_CODE, OLT_NAME, OLT_LOCATION, OLT_LOCATION_CODE,
                REGION, MOBILE_REGION, MOBILE_CLUSTER, CITY, CITY_GROUP,
@@ -834,16 +885,29 @@ def render_fat_detail(con, fat_code):
     # ─── DAFTAR HOMEPASS ────────────────────────────────────────────────────
     st.markdown("#### 🏠 Daftar Homepass pada FAT ini")
 
+    # 7 Nov: jalan / blok / no. rumah / RT-RW ditampilkan di depan (dulu hanya terselip di FULL_ADDRESS yang
+    # terpotong) supaya bisa dicek apakah nomor rumah di lokasi sudah punya HPID di FAT ini
     hpid_list = con.execute("""
-        SELECT HOMEPASS_ID, HOMEPASS_STATUS, VENDOR_NAME, NETWORK_ID,
+        SELECT HOMEPASS_ID, HOMEPASS_STATUS, STREET_NAME, BLOCK, HOUSE_NUMBER,
+               CASE WHEN coalesce(nullif(nullif(trim(RT), ''), '-'), nullif(nullif(trim(RW), ''), '-')) IS NULL
+                    THEN '' ELSE coalesce(nullif(nullif(trim(RT), ''), '-'), '-') || '/'
+                                 || coalesce(nullif(nullif(trim(RW), ''), '-'), '-') END AS RT_RW,
+               FLOOR, VENDOR_NAME, NETWORK_ID,
                FRAME, SLOT, PORT, RFS_DATE, BUILDING_NAME, FULL_ADDRESS,
                IP_DEVICE, VLAN_SERVICE, SOURCE_FILE, REMARKS
         FROM hpdb
         WHERE FAT_CODE = ?
         ORDER BY
             CASE WHEN PORT ~ '^[0-9]+$' THEN CAST(PORT AS INTEGER) ELSE 999 END,
-            PORT
+            PORT, STREET_NAME, BLOCK,
+            TRY_CAST(regexp_extract(HOUSE_NUMBER, '([0-9]+)', 1) AS INTEGER), HOUSE_NUMBER
     """, [fat_code]).df()
+    for _k in ("STREET_NAME", "BLOCK", "HOUSE_NUMBER", "FLOOR"):
+        hpid_list[_k] = hpid_list[_k].fillna("").astype(str).str.strip().replace({"-": "", "nan": "", "None": ""})
+    if not (hpid_list["FLOOR"] != "").any():        # lantai hanya bermakna untuk apartemen/ruko
+        hpid_list = hpid_list.drop(columns=["FLOOR"])
+
+    _cek_nomor_rumah(hpid_list, fat_code, ns)
 
     st.dataframe(
         hpid_list,
@@ -853,6 +917,12 @@ def render_fat_detail(con, fat_code):
         column_config={
             "HOMEPASS_ID": st.column_config.TextColumn("Homepass ID"),
             "HOMEPASS_STATUS": st.column_config.TextColumn("Status"),
+            "STREET_NAME": st.column_config.TextColumn("Jalan"),
+            "BLOCK": st.column_config.TextColumn("Blok"),
+            "HOUSE_NUMBER": st.column_config.TextColumn(
+                "No. Rumah", help="Berawalan ?- = nomor dummy (rumah tanpa nomor / belum diketahui)"),
+            "RT_RW": st.column_config.TextColumn("RT/RW"),
+            "FLOOR": st.column_config.TextColumn("Lantai"),
             "VENDOR_NAME": st.column_config.TextColumn("Vendor"),
             "NETWORK_ID": st.column_config.TextColumn("Network ID"),
             "FRAME": st.column_config.TextColumn("Frame"),
@@ -867,7 +937,11 @@ def render_fat_detail(con, fat_code):
             "REMARKS": st.column_config.TextColumn("Remarks"),
         }
     )
-    st.caption(f"Total {len(hpid_list)} baris untuk FAT `{fat_code}`")
+    _no = hpid_list["HOUSE_NUMBER"]
+    _dummy = int(_no.str.startswith("?").sum())
+    _kosong = int((_no == "").sum())
+    st.caption(f"Total {len(hpid_list)} baris untuk FAT `{fat_code}` · no. rumah terisi "
+               f"{len(hpid_list) - _dummy - _kosong} · dummy `?-` {_dummy} · kosong {_kosong}")
 
 
 # ─── TABS ───────────────────────────────────────────────────────────────────
@@ -1991,7 +2065,7 @@ with tab_eligibility:
                     selected_eligible_fat = within_radius_road[elig_idx]["FAT_CODE"]
 
                     st.markdown("---")
-                    render_fat_detail(con, selected_eligible_fat)
+                    render_fat_detail(con, selected_eligible_fat, ns="elig")
 
                 # ─── CEK HPID TERDEKAT ───────────────────────────────────────────
                 st.markdown("---")
